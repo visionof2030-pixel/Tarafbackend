@@ -1,4 +1,4 @@
 fastapi
 uvicorn
+pyjwt
 google-generativeai
-gunicorn
