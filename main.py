@@ -11,6 +11,7 @@ import google.generativeai as genai
 
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 # =====================================================
@@ -627,10 +628,8 @@ async def log_requests(request: Request, call_next):
     try:
         response = await call_next(request)
         
-        # حساب وقت الاستجابة
         process_time = time.time() - start_time
         
-        # تسجيل المعلومات الآمنة فقط
         log_data = {
             "method": request.method,
             "path": request.url.path,
@@ -639,12 +638,10 @@ async def log_requests(request: Request, call_next):
             "timestamp": datetime.utcnow().isoformat()
         }
         
-        # لا تسجل tokens أو sensitive data
         print(f"[LOG] {log_data}")
         
         return response
     except Exception as e:
-        # تسجيل الخطأ بدون تفاصيل حساسة
         print(f"[ERROR] {request.method} {request.url.path} - {type(e).__name__}")
         raise
 
@@ -660,6 +657,135 @@ def health():
         "service": "ناصر - أداة إصدار التقارير التعليمية",
         "version": "2.0.0"
     }
+
+# =====================================================
+# 🖥️ ADMIN PANEL (NO CORS ISSUES)
+# =====================================================
+@app.get("/admin", include_in_schema=False)
+def admin_panel():
+    return HTMLResponse("""
+<!DOCTYPE html>
+<html lang="ar">
+<head>
+<meta charset="UTF-8">
+<title>Admin Panel</title>
+
+<style>
+body {
+  background:#0f172a;
+  color:#ffffff;
+  font-family: system-ui, -apple-system;
+  display:flex;
+  justify-content:center;
+  align-items:center;
+  height:100vh;
+  margin:0;
+}
+
+.box {
+  background:#020617;
+  padding:30px;
+  border-radius:14px;
+  width:320px;
+  box-shadow:0 20px 40px rgba(0,0,0,.6);
+}
+
+h3 {
+  text-align:center;
+  margin-bottom:20px;
+}
+
+input, select, button {
+  width:100%;
+  margin-top:12px;
+  padding:12px;
+  border-radius:10px;
+  border:none;
+  outline:none;
+  font-size:14px;
+}
+
+input, select {
+  background:#020617;
+  color:#fff;
+  border:1px solid #1e293b;
+}
+
+button {
+  background:#2563eb;
+  color:#fff;
+  font-weight:bold;
+  cursor:pointer;
+}
+
+button:hover {
+  background:#1d4ed8;
+}
+
+pre {
+  margin-top:15px;
+  background:#020617;
+  padding:12px;
+  border-radius:10px;
+  font-size:13px;
+  white-space:pre-wrap;
+  word-break:break-word;
+  border:1px solid #1e293b;
+}
+</style>
+</head>
+
+<body>
+<div class="box">
+
+  <h3>Admin Panel</h3>
+
+  <input id="key" type="password" placeholder="ADMIN TOKEN">
+
+  <select id="duration">
+    <option value="5m">5 دقائق</option>
+    <option value="30m">30 دقيقة</option>
+    <option value="1h">ساعة</option>
+    <option value="1d">يوم</option>
+    <option value="7d">7 أيام</option>
+    <option value="30d">30 يوم</option>
+  </select>
+
+  <button onclick="generate()">توليد كود</button>
+
+  <pre id="out"></pre>
+
+</div>
+
+<script>
+async function generate() {
+  const out = document.getElementById("out");
+  out.textContent = "جارٍ الاتصال بالسيرفر...";
+
+  try {
+    const res = await fetch("/generate-code", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        key: document.getElementById("key").value,
+        duration: document.getElementById("duration").value
+      })
+    });
+
+    const data = await res.json();
+    out.textContent = JSON.stringify(data, null, 2);
+
+  } catch (e) {
+    out.textContent = "❌ فشل الاتصال بالسيرفر";
+  }
+}
+</script>
+
+</body>
+</html>
+""")
 
 # -----------------------------------------------------
 # 🛡️ توليد كود (مشرف) - محصن
@@ -682,7 +808,6 @@ def generate_code(data: dict):
     expires_at = datetime.utcnow() + DURATIONS[duration]
     VALID_CODES[code_hash] = expires_at
 
-    # لا ترجع تفاصيل أكثر من اللازم
     return {
         "activation_code": code,
         "duration": duration,
