@@ -1,53 +1,24 @@
-# main.py
-from fastapi import FastAPI, HTTPException, Depends, Header
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
 import os
-import itertools
+import random
+import hashlib
+import secrets
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
+
+import jwt
 import google.generativeai as genai
-from database import init_db, get_connection
-from create_key import create_key
-from security import activation_required
 
-try:
-    init_db()
-except Exception as e:
-    print("DB INIT ERROR:", e)
+from fastapi import FastAPI, HTTPException, Header
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
+# =====================================================
+# ENV
+# =====================================================
+JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_ME_SECRET")
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "FahadJassar14061436")
 
-app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-class Req(BaseModel):
-    prompt: str
-    model: str | None = "gemini-2.5-flash-lite"
-    reportData: dict | None = None
-
-class GenerateKeyReq(BaseModel):
-    expires_at: str | None = None
-    usage_limit: int | None = None
-
-class FillAIRequest(BaseModel):
-    reportType: str
-    subject: str | None = None
-    lesson: str | None = None
-    grade: str | None = None
-    target: str | None = None
-    place: str | None = None
-    count: str | None = None
-    category: str | None = None
-    manualTitle: str | None = None
-
-api_keys = [
+GEMINI_KEYS = [
     os.getenv("GEMINI_API_KEY_1"),
     os.getenv("GEMINI_API_KEY_2"),
     os.getenv("GEMINI_API_KEY_3"),
@@ -56,21 +27,60 @@ api_keys = [
     os.getenv("GEMINI_API_KEY_6"),
     os.getenv("GEMINI_API_KEY_7"),
 ]
-api_keys = [k for k in api_keys if k]
+GEMINI_KEYS = [k for k in GEMINI_KEYS if k]
 
-key_cycle = itertools.cycle(api_keys) if api_keys else None
+if not GEMINI_KEYS:
+    raise RuntimeError("No Gemini API Keys found")
 
-def get_api_key():
-    if not key_cycle:
-        raise HTTPException(status_code=500, detail="No Gemini API key configured")
-    return next(key_cycle)
+# =====================================================
+# APP
+# =====================================================
+app = FastAPI(title="Nassr AI Backend - تقارير تعليمية")
 
-def admin_auth(x_admin_token: str = Header(...)):
-    if x_admin_token != ADMIN_TOKEN:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# جميع التقارير مصنفة - تم نقلها من Frontend
-all_reports_by_category = {
+# =====================================================
+# MODELS
+# =====================================================
+class AskRequest(BaseModel):
+    prompt: str
+    reportData: Optional[Dict] = None
+
+class ActivateRequest(BaseModel):
+    code: str
+
+class ReportGenerateRequest(BaseModel):
+    reportType: str
+    subject: Optional[str] = ""
+    lesson: Optional[str] = ""
+    grade: Optional[str] = ""
+    target: Optional[str] = ""
+    place: Optional[str] = ""
+    count: Optional[str] = ""
+
+# =====================================================
+# STORAGE (مؤقت - in memory)
+# =====================================================
+# code_hash -> expires_at
+VALID_CODES = {}
+
+# =====================================================
+# أنواع التقارير (من الفرونت إند)
+# =====================================================
+LINGUISTIC_ENRICHMENT = [
+    "بما يعزز من فاعلية العملية التعليمية ويرتقي بمستوى الممارسات الصفية",
+    "بما ينسجم مع توجهات التعليم الحديثة ونواتج التعلم المستهدفة",
+    "بأسلوب مهني يعكس التخطيط الجيد والتنفيذ التربوي الفعال",
+    "وفق معايير تربوية تسهم في تحسين جودة التعليم داخل الصف",
+    "وبما يدعم بناء بيئة تعلم محفزة ومشجعة على المشاركة",
+]
+
+REPORTS_BY_CATEGORY = {
     "التقارير التعليمية الصفية": [
         "تقرير أنشطة صفية",
         "تقرير توزيع وقت الحصة",
@@ -254,7 +264,6 @@ all_reports_by_category = {
         "تقرير تصميم الأنشطة اللاصفية",
         "تقرير تحليل محتوى المنهج",
         "تقرير مواءمة المنهج مع نواتج التعلم",
-        "تقرير تحديث الخطط الدراسية",
         "تقرير تطوير أدوات التقويم",
         "تقرير البحث الإجرائي"
     ],
@@ -280,18 +289,161 @@ all_reports_by_category = {
     ]
 }
 
-# إنشاء قائمة بجميع التقارير
-all_reports = []
-for category, reports in all_reports_by_category.items():
-    for report in reports:
-        all_reports.append({"name": report, "category": category})
+# =====================================================
+# النصوص الافتراضية للتقارير
+# =====================================================
+DEFAULT_REPORT_TEXTS = {
+    "goal": [
+        "تنمية المهارات الأساسية في المادة وتحقيق الأهداف التعليمية المحددة",
+        "تحسين مستوى التحصيل الدراسي للطلاب وتعزيز دافعيتهم للتعلم",
+        "تطبيق استراتيجيات تعليمية متنوعة لتحسين جودة العملية التعليمية"
+    ],
+    "summary": [
+        "تقرير يوثق الأنشطة التعليمية المنفذة ونتائجها وفق المعايير التربوية",
+        "وثيقة تربوية تسجل الجهود المبذولة لتحقيق أهداف الدرس والمنهج",
+        "تقرير مهني يعكس الممارسات التعليمية الفعالة والتطوير المستمر"
+    ],
+    "steps": [
+        "بدأت الحصة بالتهيئة المناسبة ثم الانتقال إلى شرح المفهوم الرئيسي",
+        "تم تقسيم الطلاب إلى مجموعات تعاونية لممارسة الأنشطة العملية",
+        "شمل التنفيذ العروض التقديمية والتطبيقات العملية والتقويم المستمر"
+    ],
+    "strategies": [
+        "استخدام التعلم التعاوني والتعلم القائم على المشاريع",
+        "توظيف استراتيجيات التفكير الناقد والتعلم النشط",
+        "دمج التقنية في التعليم واستخدام الوسائل المتعددة"
+    ],
+    "strengths": [
+        "تفاعل الطلاب الإيجابي ومشاركتهم الفعالة في الأنشطة",
+        "تنوع الوسائل التعليمية المستخدمة وملاءمتها لأهداف الدرس",
+        "إدارة الصف الفعالة وتنظيم الوقت بشكل مناسب"
+    ],
+    "improve": [
+        "التركيز على الطلاب الضعاف وتقديم دعم إضافي لهم",
+        "زيادة استخدام التقنية التفاعلية في الشرح والتطبيق",
+        "تنويع أساليب التقويم لقياس جميع المهارات"
+    ],
+    "recomm": [
+        "توفير مزيد من التدريب على استراتيجيات التعلم النشط",
+        "تعزيز الشراكة مع أولياء الأمور لمتابعة التحصيل الدراسي",
+        "تطوير بنك الأنشطة الإثرائية لدعم المتفوقين"
+    ]
+}
 
-# البرومبت المهني - تم نقله من Frontend
-PROFESSIONAL_PROMPT = """أنت خبير تربوي تعليمي محترف تمتلك خبرة ميدانية واسعة في التعليم العام.  
+# =====================================================
+# أدوات ووسائل تعليمية
+# =====================================================
+EDUCATIONAL_TOOLS = [
+    "سبورة",
+    "سبورة ذكية",
+    "جهاز عرض",
+    "أوراق عمل",
+    "حاسب",
+    "عرض تقديمي",
+    "بطاقات تعليمية",
+    "صور توضيحية",
+    "كتاب",
+    "أدوات رياضية"
+]
+
+# =====================================================
+# إدارات التعليم (من الفرونت إند)
+# =====================================================
+EDUCATION_ADMINISTRATIONS = [
+    "الإدارة العامة للتعليم بمنطقة مكة المكرمة",
+    "الإدارة العامة للتعليم بمنطقة الرياض",
+    "الإدارة العامة للتعليم بمنطقة المدينة المنورة",
+    "الإدارة العامة للتعليم بالمنطقة الشرقية",
+    "الإدارة العامة للتعليم بمنطقة القصيم",
+    "الإدارة العامة للتعليم بمنطقة عسير",
+    "الإدارة العامة للتعليم بمنطقة تبوك",
+    "الإدارة العامة للتعليم بمنطقة حائل",
+    "الإدارة العامة للتعليم بمنطقة الحدود الشمالية",
+    "الإدارة العامة للتعليم بمنطقة جازان",
+    "الإدارة العامة للتعليم بمنطقة نجران",
+    "الإدارة العامة للتعليم بمنطقة الباحة",
+    "الإدارة العامة للتعليم بمنطقة الجوف",
+    "الإدارة العامة للتعليم بمحافظة الأحساء",
+    "الإدارة العامة للتعليم بمحافظة الطائف",
+    "الإدارة العامة للتعليم بمحافظة جدة"
+]
+
+# =====================================================
+# HELPERS
+# =====================================================
+def pick_gemini_model():
+    key = random.choice(GEMINI_KEYS)
+    genai.configure(api_key=key)
+    return genai.GenerativeModel("models/gemini-2.5-flash-lite")
+
+def generate_short_code():
+    return secrets.token_hex(3).upper()
+
+def hash_code(code: str):
+    return hashlib.sha256(code.encode()).hexdigest()
+
+# =====================================================
+# JWT FIX — النسخة الصحيحة المستقرة
+# =====================================================
+
+# -----------------------------------------------------
+# إنشاء JWT (مُصحّح)
+# -----------------------------------------------------
+def create_jwt(expires_at: datetime):
+    payload = {
+        "t": "a",  # activation token (مختصر)
+        "exp": int(expires_at.timestamp())  # MUST be int (Unix timestamp)
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
+# -----------------------------------------------------
+# التحقق من JWT (مُصحّح)
+# -----------------------------------------------------
+def verify_jwt(token: str):
+    try:
+        payload = jwt.decode(
+            token,
+            JWT_SECRET,
+            algorithms=["HS256"],
+            options={"require": ["exp"]}
+        )
+        return payload
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="TOKEN_EXPIRED")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="INVALID_TOKEN")
+
+# =====================================================
+# DURATIONS
+# =====================================================
+DURATIONS = {
+    "5m": timedelta(minutes=5),
+    "30m": timedelta(minutes=30),
+    "1h": timedelta(hours=1),
+    "3h": timedelta(hours=3),
+    "1d": timedelta(days=1),
+    "3d": timedelta(days=3),
+    "7d": timedelta(days=7),
+    "30d": timedelta(days=30),
+    "90d": timedelta(days=90),
+    "150d": timedelta(days=150),
+}
+
+# =====================================================
+# البرومت المتخصص للتقارير التعليمية
+# =====================================================
+def generate_educational_prompt(report_type: str, subject: str = "", lesson: str = "", 
+                               grade: str = "", target: str = "", place: str = "", count: str = "") -> str:
+    return f"""أنت خبير تربوي تعليمي محترف تمتلك خبرة ميدانية واسعة في التعليم العام.  
 اعتمد منظورًا تربويًا مهنيًا احترافيًا يركّز على تحسين جودة التعليم، ودعم المعلم، وتعزيز بيئة التعلّم، وخدمة القيادة المدرسية.  
 
 التقرير المطلوب: "{report_type}"
-{subject_text}{lesson_text}{grade_text}{target_text}{place_text}{count_text}
+{subject if subject else ''}
+{lesson if lesson else ''}
+{grade if grade else ''}
+{target if target else ''}
+{place if place else ''}
+{count if count else ''}
 
 **توجيهات مهنية:**
 - كن موضوعيًا ومتزنًا وبنّاءً  
@@ -301,10 +453,11 @@ PROFESSIONAL_PROMPT = """أنت خبير تربوي تعليمي محترف تم
 - ركّز على جودة التعليم وأثر الممارسات على تعلم الطلاب  
 - التزم بلغة عربية فصيحة سليمة وخالية من الأخطاء  
 
-**شروط المحتوى:**
-اكتب محتوى كل حقل بصيغة تقريرية مهنية وكأنه صادر عن المعلم.
+**شروط المحتوى:**اكتب محتوى كل حقل بصيغة تقريرية مهنية وكأنه صادر عن المعلم.
 لا تكتب أبداً عنوان الحقل داخل المحتوى ولا تعِد صياغته بصيغة مباشرة (مثل: الهدف التربوي هو، النبذة المختصرة).
-يجب أن يحتوي كل حقل على ما يقارب 25 كلمة.
+⚠️ شرط إلزامي: 
+- يجب أن يحتوي كل حقل على ما لا يقل عن 25 كلمة ولا يزيد عن 30 كلمة.
+- أي حقل أقل من ذلك يُعد غير مقبول.
 ابدأ بالمضمون مباشرة دون تمهيد أو عبارات إنشائية.
 يمكن الاستفادة من معنى العنوان أو أحد مفاهيمه بشكل غير مباشر فقط عند الحاجة وبما يخدم الفكرة دون تكرار أو حشو.
 احرص على وجود ترابط منطقي بين الأهداف، النبذة المختصرة، الاستراتيجيات، إجراءات التنفيذ، نقاط القوة، نقاط التحسين، والتوصيات.
@@ -312,7 +465,7 @@ PROFESSIONAL_PROMPT = """أنت خبير تربوي تعليمي محترف تم
 اجعل الهدف النهائي للمحتوى تحسين الممارسة التعليمية ودعم التطوير المهني المستدام.
 راعِ الوضوح والترابط، واجعل كل جملة تضيف قيمة تعليمية فعلية.
 
-**الحقول المطلوبة:**
+الحقول المطلوبة:
 1. الهدف التربوي
 2. نبذة مختصرة  
 3. إجراءات التنفيذ
@@ -323,112 +476,277 @@ PROFESSIONAL_PROMPT = """أنت خبير تربوي تعليمي محترف تم
 
 يرجى تقديم الإجابة باللغة العربية الفصحى، وتنظيمها بحيث يكون كل حقل في سطر منفصل يبدأ برقمه فقط دون ذكر العنوان."""
 
-@app.get("/")
-def root():
-    return {"status": "running"}
+# =====================================================
+# دالة الإثراء الذكي
+# =====================================================
+def enrich_and_enforce(text: str, min_words=25, max_words=35, report_type: str = "") -> str:
+    """
+    إثراء النص وتطبيق الحد الأدنى والأقصى للكلمات بشكل ذكي
+    """
+    if not text or text.strip() == "":
+        # نص افتراضي إذا كان فارغاً
+        default_texts = [
+            "تنفيذ الأنشطة التعليمية المخططة وفق أهداف الدرس والمعايير التربوية المعتمدة",
+            "تطبيق استراتيجيات تعليمية متنوعة لتحقيق نواتج التعلم المستهدفة بشكل فعال",
+            "توظيف الوسائل التعليمية المناسبة لتعزيز فهم الطلاب وتفعيل مشاركتهم في الدرس"
+        ]
+        text = random.choice(default_texts)
+    
+    words = text.split()
+    
+    if len(words) == 0:
+        return text
+    
+    # تحليل السياق من نوع التقرير
+    context_keywords = {
+        "تقرير علاجي": ["العلاج", "الدعم", "تحسين", "تقدم"],
+        "تقرير سلوكي": ["السلوك", "تحفيز", "تعزيز", "مكافأة"],
+        "تقرير تقييمي": ["تقييم", "قياس", "نتائج", "مؤشرات"],
+        "تقرير نشاط": ["نشاط", "مشاركة", "تفاعل", "تطبيق"],
+    }
+    
+    # تحديد الكلمات الإثرائية المناسبة للسياق
+    enrichment_phrases = []
+    for keyword, phrases in context_keywords.items():
+        if keyword in report_type:
+            enrichment_phrases.extend(phrases)
+    
+    # إذا لم نجد سياق محدد، نستخدم الإثراء العام
+    if not enrichment_phrases:
+        enrichment_phrases = LINGUISTIC_ENRICHMENT
+    
+    # إثراء النص إذا كان قصيراً
+    if len(words) < min_words:
+        # احتساب عدد الكلمات المطلوبة
+        words_needed = min_words - len(words)
+        
+        # إضافة عبارات إثرائية ذكية
+        if len(words) < 15:  # إذا كان النص قصير جداً
+            # إضافة عبارات تربوية محسنة
+            enhancements = [
+                "بما يعزز من جودة الممارسة التعليمية وينسجم مع أهداف المنهج",
+                "وذلك لتحقيق نواتج التعلم المستهدفة ورفع مستوى التحصيل الدراسي",
+                "بما يدعم التطوير المهني المستدام ويعزز فاعلية العملية التعليمية",
+                "ويسهم في بناء بيئة تعلمية محفزة تدعم الإبداع والتميز",
+                "وذلك تماشياً مع رؤية التعليم الحديثة واستراتيجياته التطويرية",
+                "بما يرتقي بالممارسات الصفية ويعزز الشراكة المجتمعية الفاعلة",
+            ]
+            
+            for enhancement in enhancements[:min(2, words_needed//10)]:
+                if len(words) < min_words:
+                    text += " " + enhancement
+                    words = text.split()
+        
+        # إذا مازال النقص موجوداً
+        while len(words) < min_words:
+            # اختيار عبارة إثرائية مناسبة
+            phrase = random.choice(enrichment_phrases)
+            
+            # التأكد من أن الإضافة تتناسب مع سياق النص
+            if not any(word in text for word in phrase.split()[:3]):
+                text += " " + phrase
+                words = text.split()
+    
+    # تقليم النص إذا تجاوز الحد الأقصى
+    if len(words) > max_words:
+        # المحاولة لتقليم النص بشكل ذكي
+        sentences = text.split('،')
+        if len(sentences) > 1:
+            trimmed_text = ""
+            current_words = 0
+            for sentence in sentences:
+                sentence_words = sentence.split()
+                if current_words + len(sentence_words) <= max_words - 5:  # ترك مساحة للختام
+                    if trimmed_text:
+                        trimmed_text += "، " + sentence
+                    else:
+                        trimmed_text = sentence
+                    current_words += len(sentence_words)
+                else:
+                    break
+            
+            if current_words >= min_words:
+                text = trimmed_text + "، مما يسهم في تحقيق الأهداف التربوية المنشودة."
+                words = text.split()
+        
+        # إذا مازال الطول زائداً، قص الكلمات الزائدة
+        if len(words) > max_words:
+            text = " ".join(words[:max_words])
+    
+    # تحسين جودة النص النهائي
+    text = text.replace("  ", " ").strip()
+    
+    # إضافة نقطة نهائية إذا لم تكن موجودة
+    if text and text[-1] not in [".", "!", "؟"]:
+        text += "."
+    
+    return text
 
-@app.get("/health")
-def health(_: None = Depends(activation_required)):
+# =====================================================
+# ROUTES
+# =====================================================
+
+@app.get("/")
+def health():
+    return {
+        "status": "healthy",
+        "time": datetime.utcnow().isoformat(),
+        "service": "ناصر - أداة إصدار التقارير التعليمية"
+    }
+
+# -----------------------------------------------------
+# توليد كود (مشرف)
+# -----------------------------------------------------
+@app.get("/generate-code")
+def generate_code(key: str, duration: str):
+    if key != ADMIN_TOKEN:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    if duration not in DURATIONS:
+        raise HTTPException(status_code=400, detail="Invalid duration")
+
+    code = generate_short_code()
+    code_hash = hash_code(code)
+
+    expires_at = datetime.utcnow() + DURATIONS[duration]
+    VALID_CODES[code_hash] = expires_at
+
+    return {
+        "activation_code": code,
+        "duration": duration,
+        "expires_at": expires_at.isoformat() + "Z"
+    }
+
+# -----------------------------------------------------
+# تفعيل كود
+# -----------------------------------------------------
+@app.post("/activate")
+def activate(data: ActivateRequest):
+    code = data.code.strip()
+    if not code:
+        raise HTTPException(status_code=400, detail="CODE_REQUIRED")
+
+    code_hash = hash_code(code)
+    expires_at = VALID_CODES.get(code_hash)
+
+    if not expires_at:
+        raise HTTPException(status_code=403, detail="INVALID_CODE")
+
+    if expires_at < datetime.utcnow():
+        VALID_CODES.pop(code_hash, None)
+        raise HTTPException(status_code=403, detail="CODE_EXPIRED")
+
+    token = create_jwt(expires_at)
+
+    return {
+        "token": token,
+        "expires_at": expires_at.isoformat() + "Z"
+    }
+
+# -----------------------------------------------------
+# تحقق من التوكن
+# -----------------------------------------------------
+@app.get("/verify")
+def verify(x_token: str = Header(..., alias="X-Token")):
+    verify_jwt(x_token)
     return {"status": "ok"}
 
+# -----------------------------------------------------
+# الحصول على أنواع التقارير
+# -----------------------------------------------------
 @app.get("/reports/categories")
-def get_categories(_: None = Depends(activation_required)):
-    """الحصول على جميع تصنيفات التقارير"""
-    return {"categories": list(all_reports_by_category.keys())}
+def get_report_categories():
+    return {
+        "categories": list(REPORTS_BY_CATEGORY.keys()),
+        "reports_by_category": REPORTS_BY_CATEGORY
+    }
 
-@app.get("/reports/all")
-def get_all_reports(_: None = Depends(activation_required)):
-    """الحصول على جميع التقارير"""
-    return {"reports": all_reports}
-
-@app.get("/reports/category/{category_name}")
-def get_reports_by_category(category_name: str, _: None = Depends(activation_required)):
-    """الحصول على التقارير حسب التصنيف"""
-    if category_name not in all_reports_by_category:
-        raise HTTPException(status_code=404, detail="التصنيف غير موجود")
-    return {"category": category_name, "reports": all_reports_by_category[category_name]}
-
-@app.get("/reports/search/{search_term}")
-def search_reports(search_term: str, _: None = Depends(activation_required)):
-    """بحث في التقارير"""
-    search_term_lower = search_term.lower()
+# -----------------------------------------------------
+# البحث في التقارير
+# -----------------------------------------------------
+@app.get("/reports/search")
+def search_reports(query: str):
+    if not query or len(query.strip()) < 2:
+        return {"results": []}
+    
+    search_term = query.strip().lower()
     results = []
     
-    for report in all_reports:
-        if search_term_lower in report["name"].lower():
-            results.append(report)
+    for category, reports in REPORTS_BY_CATEGORY.items():
+        for report in reports:
+            if search_term in report.lower():
+                results.append({
+                    "name": report,
+                    "category": category
+                })
     
     return {"results": results}
 
-@app.post("/ask")
-def ask(req: Req, _: None = Depends(activation_required)):
-    """الدالة الأصلية للذكاء الاصطناعي"""
+# -----------------------------------------------------
+# الحصول على نصوص تقرير معين
+# -----------------------------------------------------
+@app.get("/reports/texts/{report_type}")
+def get_report_texts(report_type: str):
+    # في الواقع، هذه النصوص يتم توليدها بالذكاء الاصطناعي
+    # نرجع النصوص الافتراضية كبادئة
+    return {
+        "report_type": report_type,
+        "default_texts": DEFAULT_REPORT_TEXTS,
+        "message": "استخدم /generate/report للحصول على نصوص مخصصة بالذكاء الاصطناعي"
+    }
+
+# -----------------------------------------------------
+# الحصول على إدارات التعليم
+# -----------------------------------------------------
+@app.get("/education/administrations")
+def get_education_administrations():
+    return {
+        "administrations": EDUCATION_ADMINISTRATIONS
+    }
+
+# -----------------------------------------------------
+# الحصول على الأدوات التعليمية
+# -----------------------------------------------------
+@app.get("/education/tools")
+def get_educational_tools():
+    return {
+        "tools": EDUCATIONAL_TOOLS
+    }
+
+# -----------------------------------------------------
+# الذكاء الاصطناعي العام (القديم)
+# -----------------------------------------------------
+@app.post("/generate")
+def generate_ai_content(data: AskRequest, x_token: str = Header(..., alias="X-Token")):
+    verify_jwt(x_token)
+
     try:
-        genai.configure(api_key=get_api_key())
-        model_name = req.model if req.model else "gemini-2.5-flash-lite"
-        model = genai.GenerativeModel(f"models/{model_name}")
-        response = model.generate_content(req.prompt)
+        model = pick_gemini_model()
+        response = model.generate_content(data.prompt)
         return {"answer": response.text}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"خطأ في الذكاء الاصطناعي: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/fill-with-ai")
-def fill_with_ai(req: FillAIRequest, _: None = Depends(activation_required)):
-    """تعبئة التقرير باستخدام الذكاء الاصطناعي"""
-    try:
-        # التحقق من وجود نوع التقرير
-        if not req.reportType or req.reportType == "تقرير":
-            raise HTTPException(status_code=400, detail="الرجاء تحديد نوع التقرير")
-        
-        # بناء النص الإضافي
-        additional_info = ""
-        if req.subject:
-            additional_info += f"المادة: {req.subject}\n"
-        if req.lesson:
-            additional_info += f"الدرس: {req.lesson}\n"
-        if req.grade:
-            additional_info += f"الصف: {req.grade}\n"
-        if req.target:
-            additional_info += f"المستهدفون: {req.target}\n"
-        if req.place:
-            additional_info += f"مكان التنفيذ: {req.place}\n"
-        if req.count:
-            additional_info += f"عدد الحضور: {req.count}\n"
-        
-        # بناء البرومبت الكامل
-        full_prompt = PROFESSIONAL_PROMPT.format(
-            report_type=req.reportType,
-            subject_text=f"المادة: {req.subject}\n" if req.subject else "",
-            lesson_text=f"الدرس: {req.lesson}\n" if req.lesson else "",
-            grade_text=f"الصف: {req.grade}\n" if req.grade else "",
-            target_text=f"المستهدفون: {req.target}\n" if req.target else "",
-            place_text=f"مكان التنفيذ: {req.place}\n" if req.place else "",
-            count_text=f"عدد الحضور: {req.count}" if req.count else ""
-        )
-        
-        # استدعاء الذكاء الاصطناعي
-        genai.configure(api_key=get_api_key())
-        model = genai.GenerativeModel("models/gemini-2.5-flash-lite")
-        response = model.generate_content(full_prompt)
-        
-        # تحليل الاستجابة
-        ai_response = response.text
-        parsed_fields = parse_ai_response_professional(ai_response)
-        
-        return {
-            "success": True,
-            "fields": parsed_fields,
-            "raw_response": ai_response
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"خطأ في تعبئة التقرير: {str(e)}")
-
-def parse_ai_response_professional(response: str) -> dict:
-    """تحليل استجابة الذكاء الاصطناعي المهنية"""
-    lines = response.split('\n')
+# -----------------------------------------------------
+# تحليل استجابة الذكاء الاصطناعي
+# -----------------------------------------------------
+def parse_ai_response(response_text: str, report_type: str = "") -> Dict[str, str]:
+    """تحليل النص الذي يرجع من الذكاء الاصطناعي إلى حقول مع إثراء ذكي"""
+    
+    # تنظيف النص
+    response_text = response_text.strip()
+    
+    # خريطة التعرف على بدايات الحقول
+    field_patterns = {
+        "goal": ["1.", "١.", "1-", "1 ", "الهدف", "هدف"],
+        "summary": ["2.", "٢.", "2-", "2 ", "نبذة", "ملخص", "مختصر"],
+        "steps": ["3.", "٣.", "3-", "3 ", "إجراءات", "خطوات", "تنفيذ"],
+        "strategies": ["4.", "٤.", "4-", "4 ", "استراتيجيات", "طرق", "أساليب"],
+        "strengths": ["5.", "٥.", "5-", "5 ", "نقاط القوة", "قوة", "إيجابيات"],
+        "improve": ["6.", "٦.", "6-", "6 ", "نقاط التحسين", "تحسين", "تطوير"],
+        "recomm": ["7.", "٧.", "7-", "7 ", "توصيات", "اقتراحات", "نصائح"]
+    }
+    
     parsed = {
         "goal": "",
         "summary": "",
@@ -439,192 +757,157 @@ def parse_ai_response_professional(response: str) -> dict:
         "recomm": ""
     }
     
-    field_mapping = {
-        '1': 'goal',
-        '2': 'summary',
-        '3': 'steps',
-        '4': 'strategies',
-        '5': 'strengths',
-        '6': 'improve',
-        '7': 'recomm'
-    }
+    # إذا كان النص قصيراً أو غير منظم
+    lines = response_text.split('\n')
+    current_field = None
+    field_content = []
     
     for line in lines:
         line = line.strip()
         if not line:
             continue
             
-        # البحث عن نمط "رقم. محتوى"
-        for i in range(1, 8):
-            if line.startswith(f"{i}.") or line.startswith(f"{i}-"):
-                content = line[2:].strip()
-                # إزالة أي عناوين محتملة
-                content = remove_field_titles(content)
-                # ضمان عدد الكلمات
-                content = ensure_word_count(content, 25)
-                # إضافة لمسة مهنية
-                content = add_professional_touch(content, field_mapping[str(i)])
-                parsed[field_mapping[str(i)]] = content
+        # البحث عن بداية حقل جديد
+        found_field = None
+        for field, patterns in field_patterns.items():
+            for pattern in patterns:
+                if line.startswith(pattern) or pattern in line[:10]:
+                    found_field = field
+                    break
+            if found_field:
                 break
+        
+        if found_field:
+            # حفظ الحقل السابق
+            if current_field and field_content:
+                parsed[current_field] = ' '.join(field_content).strip()
+            
+            # بدء حقل جديد
+            current_field = found_field
+            # إزالة النمط من بداية السطر
+            for pattern in field_patterns[found_field]:
+                if line.startswith(pattern):
+                    line = line[len(pattern):].strip()
+                    break
+            field_content = [line] if line else []
+        elif current_field:
+            field_content.append(line)
     
-    # إذا لم يتم العثور على الحقول بالتنسيق المتوقع
-    if not any(parsed.values()):
-        parsed = fallback_professional_ai_parsing(response)
+    # الحقل الأخير
+    if current_field and field_content:
+        parsed[current_field] = ' '.join(field_content).strip()
+    
+    # تطبيق الإثراء الذكي على كل حقل
+    for key in parsed:
+        if parsed[key]:  # إذا كان النص غير فارغ
+            parsed[key] = enrich_and_enforce(parsed[key], 25, 35, report_type)
+        else:
+            # استخدام نصوص افتراضية إذا كان الحقل فارغاً
+            if key in DEFAULT_REPORT_TEXTS:
+                default_text = random.choice(DEFAULT_REPORT_TEXTS[key])
+                parsed[key] = enrich_and_enforce(default_text, 25, 35, report_type)
     
     return parsed
 
-def remove_field_titles(content: str) -> str:
-    """إزالة عناوين الحقول من النص"""
-    field_titles = [
-        'الهدف التربوي', 'الهدف',
-        'نبذة مختصرة', 'نبذة',
-        'إجراءات التنفيذ', 'إجراءات',
-        'الاستراتيجيات', 'الاستراتيجيات',
-        'نقاط القوة', 'نقاط',
-        'نقاط التحسين', 'تحسين',
-        'التوصيات', 'التوصيات',
-        'هو:', 'تشمل:', 'يشمل:', 'يتضمن:', 'يتمثل في'
-    ]
+# -----------------------------------------------------
+# توليد تقرير تعليمي متكامل (الجديد)
+# -----------------------------------------------------
+@app.post("/generate/report")
+def generate_educational_report(data: ReportGenerateRequest, x_token: str = Header(..., alias="X-Token")):
+    verify_jwt(x_token)
     
-    cleaned = content
-    for title in field_titles:
-        pattern = f"^{title}[:\\.\\-]?\\s*"
-        import re
-        cleaned = re.sub(pattern, '', cleaned, flags=re.IGNORECASE)
+    if not data.reportType:
+        raise HTTPException(status_code=400, detail="نوع التقرير مطلوب")
     
-    return cleaned.strip()
-
-def ensure_word_count(content: str, target_words: int) -> str:
-    """ضمان عدد الكلمات المطلوب"""
-    words = content.split()
-    if len(words) >= target_words - 5 and len(words) <= target_words + 5:
-        return content
-    
-    if len(words) < target_words - 5:
-        professional_phrases = [
-            'مع التركيز على تحقيق أهداف التعلم وتنمية المهارات الأساسية',
-            'بما يسهم في رفع مستوى التحصيل الدراسي وتحسين المخرجات التعليمية',
-            'وذلك لتحقيق التكامل بين الجوانب المعرفية والمهارية والوجدانية',
-            'مع مراعاة الفروق الفردية وتنويع أساليب التدريس لتناسب جميع الطلاب',
-            'لضمان تحقيق رؤية التعليم وتطوير العملية التعليمية بصورة شاملة',
-            'مع الاستفادة من أفضل الممارسات التربوية والتقنيات التعليمية الحديثة',
-            'بما يعزز من دور المعلم كميسر للتعلم وموجه للطالب نحو التميز'
-        ]
+    try:
+        # إنشاء البرومت المتخصص
+        prompt = generate_educational_prompt(
+            report_type=data.reportType,
+            subject=data.subject,
+            lesson=data.lesson,
+            grade=data.grade,
+            target=data.target,
+            place=data.place,
+            count=data.count
+        )
         
-        extended = content
-        while len(extended.split()) < target_words:
-            import random
-            extended += ' ' + random.choice(professional_phrases)
+        # استخدام الذكاء الاصطناعي
+        model = pick_gemini_model()
+        response = model.generate_content(prompt)
         
-        extended_words = extended.split()
-        if len(extended_words) > target_words + 5:
-            return ' '.join(extended_words[:target_words])
+        # تحليل الاستجابة مع الإثراء الذكي
+        ai_text = response.text
+        parsed_fields = parse_ai_response(ai_text, data.reportType)
         
-        return extended
-    
-    # إذا كانت الكلمات أكثر من المطلوب
-    return ' '.join(words[:target_words])
+        return {
+            "success": True,
+            "report_type": data.reportType,
+            "parsed_fields": parsed_fields,
+            "raw_response": ai_text
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"خطأ في توليد التقرير: {str(e)}")
 
-def add_professional_touch(content: str, field_id: str) -> str:
-    """إضافة لمسة مهنية للمحتوى"""
-    words = content.split()
-    if len(words) >= 20:
-        return content
-    
-    professional_additions = {
-        'goal': ' بما يعزز من جودة التعليم ويدعم تحقيق رؤية المدرسة التعليمية',
-        'summary': ' مع التركيز على الأثر الإيجابي في تحسين الممارسات التعليمية',
-        'steps': ' ومراعاة الجوانب التربوية والنفسية للطلاب في جميع المراحل',
-        'strategies': ' بما يناسب البيئة الصفية ويحقق أقصى استفادة تعليمية',
-        'strengths': ' مما يسهم في تحقيق بيئة تعلم إيجابية ومنتجة',
-        'improve': ' مع وضع خطط تطويرية قابلة للتنفيذ في الفصول القادمة',
-        'recomm': ' بما يدعم التطوير المهني المستمر ويعزز جودة التعليم'
-    }
-    
-    if field_id in professional_additions:
-        return content + professional_additions[field_id]
-    
-    return content
+# -----------------------------------------------------
+# تحويل التاريخ الهجري إلى ميلادي
+# -----------------------------------------------------
+@app.get("/convert/hijri-to-gregorian")
+def convert_hijri_date(hijri_date: str):
+    """تحويل التاريخ الهجري إلى ميلادي (بسيط - للإنتاج تحتاج API حقيقي)"""
+    try:
+        # هذا مثال بسيط - للإنتاج تحتاج استخدام API مثل api.aladhan.com
+        # هنا نرجع نفس التاريخ كنموذج
+        return {
+            "hijri_date": hijri_date,
+            "gregorian_date": hijri_date + " (ميلادي)",
+            "note": "هذه خدمة تجريبية، للإنتاج استخدم API متخصص"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"خطأ في تحويل التاريخ: {str(e)}")
 
-def fallback_professional_ai_parsing(response: str) -> dict:
-    """نهج بديل لتحليل الاستجابة المهنية"""
-    import re
-    sentences = re.split(r'[\.\n]', response)
-    sentences = [s.strip() for s in sentences if len(s.strip()) > 20]
+# -----------------------------------------------------
+# استشارة تربوية (إضافية)
+# -----------------------------------------------------
+@app.post("/consult/educational")
+def educational_consultation(data: AskRequest, x_token: str = Header(..., alias="X-Token")):
+    """استشارة تربوية مع خبير تعليمي"""
+    verify_jwt(x_token)
     
-    # تصفية الجمل التي تحتوي على كلمات شائعة للحقول
-    filtered = []
-    for s in sentences:
-        if not any(word in s.lower() for word in ['الحقل', 'المطلوب', 'يجب', 'يرجى', 'الرجاء']):
-            filtered.append(s)
+    consult_prompt = f"""أنت مستشار تربوي محترف مع خبرة 20 سنة في المجال التعليمي.
+الاستشارة المطلوبة: {data.prompt}
+
+قدم إجابة:
+1. تحليل الموقف
+2. الحلول المقترحة (3 حلول على الأقل)
+3. خطوات التنفيذ
+4. مؤشرات النجاح
+5. نصائح احترافية
+
+اجعل الإجابة عملية وقابلة للتطبيق في البيئة التعليمية السعودية."""
     
-    fields = ['goal', 'summary', 'steps', 'strategies', 'strengths', 'improve', 'recomm']
-    parsed = {field: "" for field in fields}
-    
-    for i, field in enumerate(fields):
-        if i < len(filtered):
-            content = filtered[i]
-            content = remove_field_titles(content)
-            content = ensure_word_count(content, 25)
-            content = add_professional_touch(content, field)
-            parsed[field] = content
-    
-    return parsed
+    try:
+        model = pick_gemini_model()
+        response = model.generate_content(consult_prompt)
+        return {
+            "consultation": response.text,
+            "advisor": "خبير تربوي - نظام ناصر التعليمي"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/admin/generate", dependencies=[Depends(admin_auth)])
-def admin_generate(req: GenerateKeyReq):
-    return {"code": create_key(req.expires_at, req.usage_limit)}
+# -----------------------------------------------------
+# تحديث الذاكرة (تنظيف الكود المنتهي)
+# -----------------------------------------------------
+@app.on_event("startup")
+async def startup_event():
+    """تنظيف الذاكرة عند بدء التشغيل"""
+    global VALID_CODES
+    now = datetime.utcnow()
+    expired_codes = [k for k, v in VALID_CODES.items() if v < now]
+    for code in expired_codes:
+        VALID_CODES.pop(code, None)
 
-@app.get("/admin/codes", dependencies=[Depends(admin_auth)])
-def admin_codes():
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT id, code, is_active, usage_count FROM activation_codes")
-    rows = cur.fetchall()
-    conn.close()
-    return [
-        {"id": r[0], "code": r[1], "active": bool(r[2]), "usage": r[3]}
-        for r in rows
-    ]
-
-@app.put("/admin/code/{code_id}/toggle", dependencies=[Depends(admin_auth)])
-def admin_toggle(code_id: int):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE activation_codes SET is_active = CASE WHEN is_active=1 THEN 0 ELSE 1 END WHERE id=?",
-        (code_id,)
-    )
-    conn.commit()
-    conn.close()
-    return {"status": "ok"}
-
-@app.delete("/admin/code/{code_id}", dependencies=[Depends(admin_auth)])
-def admin_delete(code_id: int):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM activation_codes WHERE id=?", (code_id,))
-    conn.commit()
-    conn.close()
-    return {"status": "deleted"}
-
-@app.get("/admin", response_class=HTMLResponse)
-def admin_page():
-    return "<h3>Admin Panel Ready</h3>"
-
-@app.get("/tools/list")
-def get_tools_list(_: None = Depends(activation_required)):
-    """الحصول على قائمة الأدوات التعليمية"""
-    tools = [
-        "سبورة",
-        "سبورة ذكية",
-        "جهاز عرض",
-        "أوراق عمل",
-        "حاسب",
-        "عرض تقديمي",
-        "بطاقات تعليمية",
-        "صور توضيحية",
-        "كتاب",
-        "أدوات رياضية"
-    ]
-    return {"tools": tools}
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
