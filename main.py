@@ -2,21 +2,28 @@ import os
 import random
 import hashlib
 import secrets
+import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
 import jwt
 import google.generativeai as genai
 
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 # =====================================================
-# ENV
+# 🔐 ENV SECRETS (إجباري)
 # =====================================================
-JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_ME_SECRET")
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "FahadJassar14061436")
+JWT_SECRET = os.getenv("JWT_SECRET")          # لا تضع قيمة افتراضية
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")        # لا تضع قيمة افتراضية
+
+if not JWT_SECRET or len(JWT_SECRET) < 32:
+    raise RuntimeError("JWT_SECRET is missing or too weak")
+
+if not ADMIN_TOKEN:
+    raise RuntimeError("ADMIN_TOKEN is missing")
 
 GEMINI_KEYS = [
     os.getenv("GEMINI_API_KEY_1"),
@@ -33,19 +40,40 @@ if not GEMINI_KEYS:
     raise RuntimeError("No Gemini API Keys found")
 
 # =====================================================
-# APP
+# 🚀 APP INITIALIZATION
 # =====================================================
-app = FastAPI(title="Nassr AI Backend - تقارير تعليمية")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+app = FastAPI(
+    title="Nassr AI Backend - تقارير تعليمية",
+    version="2.0.0",
+    docs_url=None,  # تعطيل Swagger في Production
+    redoc_url=None  # تعطيل ReDoc في Production
 )
 
 # =====================================================
-# MODELS
+# 🔒 CORS (مقيّد على الدومين فقط)
+# =====================================================
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://tarafbackend.onrender.com",
+        "http://localhost:3000",  # للتطوير المحلي فقط
+        "http://127.0.0.1:3000"   # للتطوير المحلي فقط
+    ],
+    allow_credentials=False,
+    allow_methods=["POST", "GET", "OPTIONS"],
+    allow_headers=["X-Token", "Content-Type", "Authorization"],
+    max_age=600
+)
+
+# =====================================================
+# ⚡ RATE LIMIT STORAGE (بدون DB)
+# =====================================================
+RATE_LIMIT = 20            # 20 طلب
+RATE_WINDOW = 10           # خلال 10 ثواني
+_request_log = {}          # token -> timestamps
+
+# =====================================================
+# 📦 MODELS
 # =====================================================
 class AskRequest(BaseModel):
     prompt: str
@@ -64,13 +92,12 @@ class ReportGenerateRequest(BaseModel):
     count: Optional[str] = ""
 
 # =====================================================
-# STORAGE (مؤقت - in memory)
+# 💾 STORAGE (مؤقت - in memory)
 # =====================================================
-# code_hash -> expires_at
-VALID_CODES = {}
+VALID_CODES = {}  # code_hash -> expires_at
 
 # =====================================================
-# أنواع التقارير (من الفرونت إند)
+# 📊 أنواع التقارير
 # =====================================================
 LINGUISTIC_ENRICHMENT = [
     "بما يعزز من فاعلية العملية التعليمية ويرتقي بمستوى الممارسات الصفية",
@@ -347,7 +374,7 @@ EDUCATIONAL_TOOLS = [
 ]
 
 # =====================================================
-# إدارات التعليم (من الفرونت إند)
+# إدارات التعليم
 # =====================================================
 EDUCATION_ADMINISTRATIONS = [
     "الإدارة العامة للتعليم بمنطقة مكة المكرمة",
@@ -369,7 +396,7 @@ EDUCATION_ADMINISTRATIONS = [
 ]
 
 # =====================================================
-# HELPERS
+# 🔧 HELPERS
 # =====================================================
 def pick_gemini_model():
     key = random.choice(GEMINI_KEYS)
@@ -383,12 +410,9 @@ def hash_code(code: str):
     return hashlib.sha256(code.encode()).hexdigest()
 
 # =====================================================
-# JWT FIX — النسخة الصحيحة المستقرة
+# 🔐 JWT FIX — النسخة الصحيحة المستقرة
 # =====================================================
 
-# -----------------------------------------------------
-# إنشاء JWT (مُصحّح)
-# -----------------------------------------------------
 def create_jwt(expires_at: datetime):
     payload = {
         "t": "a",  # activation token (مختصر)
@@ -396,9 +420,6 @@ def create_jwt(expires_at: datetime):
     }
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
-# -----------------------------------------------------
-# التحقق من JWT (مُصحّح)
-# -----------------------------------------------------
 def verify_jwt(token: str):
     try:
         payload = jwt.decode(
@@ -414,7 +435,32 @@ def verify_jwt(token: str):
         raise HTTPException(status_code=401, detail="INVALID_TOKEN")
 
 # =====================================================
-# DURATIONS
+# ⚡ RATE LIMIT GUARD
+# =====================================================
+def rate_limit_guard(token: str):
+    now = time.time()
+    window_start = now - RATE_WINDOW
+
+    timestamps = _request_log.get(token, [])
+    timestamps = [t for t in timestamps if t > window_start]
+
+    if len(timestamps) >= RATE_LIMIT:
+        raise HTTPException(status_code=429, detail="TOO_MANY_REQUESTS")
+
+    timestamps.append(now)
+    _request_log[token] = timestamps
+
+# =====================================================
+# 📏 VALIDATION HELPERS
+# =====================================================
+MAX_PROMPT_LENGTH = 4000
+
+def validate_prompt(prompt: str):
+    if not prompt or len(prompt) > MAX_PROMPT_LENGTH:
+        raise HTTPException(status_code=400, detail="INVALID_PROMPT")
+
+# =====================================================
+# 🕒 DURATIONS
 # =====================================================
 DURATIONS = {
     "5m": timedelta(minutes=5),
@@ -430,7 +476,7 @@ DURATIONS = {
 }
 
 # =====================================================
-# البرومت المتخصص للتقارير التعليمية
+# 🤖 البرومت المتخصص للتقارير التعليمية
 # =====================================================
 def generate_educational_prompt(report_type: str, subject: str = "", lesson: str = "", 
                                grade: str = "", target: str = "", place: str = "", count: str = "") -> str:
@@ -477,14 +523,13 @@ def generate_educational_prompt(report_type: str, subject: str = "", lesson: str
 يرجى تقديم الإجابة باللغة العربية الفصحى، وتنظيمها بحيث يكون كل حقل في سطر منفصل يبدأ برقمه فقط دون ذكر العنوان."""
 
 # =====================================================
-# دالة الإثراء الذكي
+# 🎨 دالة الإثراء الذكي
 # =====================================================
 def enrich_and_enforce(text: str, min_words=25, max_words=35, report_type: str = "") -> str:
     """
     إثراء النص وتطبيق الحد الأدنى والأقصى للكلمات بشكل ذكي
     """
     if not text or text.strip() == "":
-        # نص افتراضي إذا كان فارغاً
         default_texts = [
             "تنفيذ الأنشطة التعليمية المخططة وفق أهداف الدرس والمعايير التربوية المعتمدة",
             "تطبيق استراتيجيات تعليمية متنوعة لتحقيق نواتج التعلم المستهدفة بشكل فعال",
@@ -497,7 +542,6 @@ def enrich_and_enforce(text: str, min_words=25, max_words=35, report_type: str =
     if len(words) == 0:
         return text
     
-    # تحليل السياق من نوع التقرير
     context_keywords = {
         "تقرير علاجي": ["العلاج", "الدعم", "تحسين", "تقدم"],
         "تقرير سلوكي": ["السلوك", "تحفيز", "تعزيز", "مكافأة"],
@@ -505,24 +549,18 @@ def enrich_and_enforce(text: str, min_words=25, max_words=35, report_type: str =
         "تقرير نشاط": ["نشاط", "مشاركة", "تفاعل", "تطبيق"],
     }
     
-    # تحديد الكلمات الإثرائية المناسبة للسياق
     enrichment_phrases = []
     for keyword, phrases in context_keywords.items():
         if keyword in report_type:
             enrichment_phrases.extend(phrases)
     
-    # إذا لم نجد سياق محدد، نستخدم الإثراء العام
     if not enrichment_phrases:
         enrichment_phrases = LINGUISTIC_ENRICHMENT
     
-    # إثراء النص إذا كان قصيراً
     if len(words) < min_words:
-        # احتساب عدد الكلمات المطلوبة
         words_needed = min_words - len(words)
         
-        # إضافة عبارات إثرائية ذكية
-        if len(words) < 15:  # إذا كان النص قصير جداً
-            # إضافة عبارات تربوية محسنة
+        if len(words) < 15:
             enhancements = [
                 "بما يعزز من جودة الممارسة التعليمية وينسجم مع أهداف المنهج",
                 "وذلك لتحقيق نواتج التعلم المستهدفة ورفع مستوى التحصيل الدراسي",
@@ -537,26 +575,20 @@ def enrich_and_enforce(text: str, min_words=25, max_words=35, report_type: str =
                     text += " " + enhancement
                     words = text.split()
         
-        # إذا مازال النقص موجوداً
         while len(words) < min_words:
-            # اختيار عبارة إثرائية مناسبة
             phrase = random.choice(enrichment_phrases)
-            
-            # التأكد من أن الإضافة تتناسب مع سياق النص
             if not any(word in text for word in phrase.split()[:3]):
                 text += " " + phrase
                 words = text.split()
     
-    # تقليم النص إذا تجاوز الحد الأقصى
     if len(words) > max_words:
-        # المحاولة لتقليم النص بشكل ذكي
         sentences = text.split('،')
         if len(sentences) > 1:
             trimmed_text = ""
             current_words = 0
             for sentence in sentences:
                 sentence_words = sentence.split()
-                if current_words + len(sentence_words) <= max_words - 5:  # ترك مساحة للختام
+                if current_words + len(sentence_words) <= max_words - 5:
                     if trimmed_text:
                         trimmed_text += "، " + sentence
                     else:
@@ -569,21 +601,55 @@ def enrich_and_enforce(text: str, min_words=25, max_words=35, report_type: str =
                 text = trimmed_text + "، مما يسهم في تحقيق الأهداف التربوية المنشودة."
                 words = text.split()
         
-        # إذا مازال الطول زائداً، قص الكلمات الزائدة
         if len(words) > max_words:
             text = " ".join(words[:max_words])
     
-    # تحسين جودة النص النهائي
     text = text.replace("  ", " ").strip()
     
-    # إضافة نقطة نهائية إذا لم تكن موجودة
     if text and text[-1] not in [".", "!", "؟"]:
         text += "."
     
     return text
 
 # =====================================================
-# ROUTES
+# 🛡️ GENERIC ERROR RESPONSES
+# =====================================================
+def safe_500():
+    raise HTTPException(status_code=500, detail="INTERNAL_ERROR")
+
+# =====================================================
+# 🚦 MIDDLEWARE FOR LOGGING
+# =====================================================
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start_time = time.time()
+    
+    try:
+        response = await call_next(request)
+        
+        # حساب وقت الاستجابة
+        process_time = time.time() - start_time
+        
+        # تسجيل المعلومات الآمنة فقط
+        log_data = {
+            "method": request.method,
+            "path": request.url.path,
+            "status_code": response.status_code,
+            "response_time": f"{process_time:.3f}s",
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+        # لا تسجل tokens أو sensitive data
+        print(f"[LOG] {log_data}")
+        
+        return response
+    except Exception as e:
+        # تسجيل الخطأ بدون تفاصيل حساسة
+        print(f"[ERROR] {request.method} {request.url.path} - {type(e).__name__}")
+        raise
+
+# =====================================================
+# 🚀 ROUTES
 # =====================================================
 
 @app.get("/")
@@ -591,14 +657,19 @@ def health():
     return {
         "status": "healthy",
         "time": datetime.utcnow().isoformat(),
-        "service": "ناصر - أداة إصدار التقارير التعليمية"
+        "service": "ناصر - أداة إصدار التقارير التعليمية",
+        "version": "2.0.0"
     }
 
 # -----------------------------------------------------
-# توليد كود (مشرف)
+# 🛡️ توليد كود (مشرف) - محصن
 # -----------------------------------------------------
-@app.get("/generate-code")
-def generate_code(key: str, duration: str):
+@app.post("/generate-code")
+def generate_code(data: dict):
+    """POST بدلاً من GET لأمان أفضل"""
+    key = data.get("key")
+    duration = data.get("duration")
+    
     if key != ADMIN_TOKEN:
         raise HTTPException(status_code=403, detail="Forbidden")
 
@@ -611,6 +682,7 @@ def generate_code(key: str, duration: str):
     expires_at = datetime.utcnow() + DURATIONS[duration]
     VALID_CODES[code_hash] = expires_at
 
+    # لا ترجع تفاصيل أكثر من اللازم
     return {
         "activation_code": code,
         "duration": duration,
@@ -618,7 +690,7 @@ def generate_code(key: str, duration: str):
     }
 
 # -----------------------------------------------------
-# تفعيل كود
+# 🔑 تفعيل كود
 # -----------------------------------------------------
 @app.post("/activate")
 def activate(data: ActivateRequest):
@@ -644,7 +716,7 @@ def activate(data: ActivateRequest):
     }
 
 # -----------------------------------------------------
-# تحقق من التوكن
+# ✅ تحقق من التوكن
 # -----------------------------------------------------
 @app.get("/verify")
 def verify(x_token: str = Header(..., alias="X-Token")):
@@ -652,7 +724,7 @@ def verify(x_token: str = Header(..., alias="X-Token")):
     return {"status": "ok"}
 
 # -----------------------------------------------------
-# الحصول على أنواع التقارير
+# 📂 الحصول على أنواع التقارير
 # -----------------------------------------------------
 @app.get("/reports/categories")
 def get_report_categories():
@@ -662,7 +734,7 @@ def get_report_categories():
     }
 
 # -----------------------------------------------------
-# البحث في التقارير
+# 🔍 البحث في التقارير
 # -----------------------------------------------------
 @app.get("/reports/search")
 def search_reports(query: str):
@@ -683,12 +755,10 @@ def search_reports(query: str):
     return {"results": results}
 
 # -----------------------------------------------------
-# الحصول على نصوص تقرير معين
+# 📝 الحصول على نصوص تقرير معين
 # -----------------------------------------------------
 @app.get("/reports/texts/{report_type}")
 def get_report_texts(report_type: str):
-    # في الواقع، هذه النصوص يتم توليدها بالذكاء الاصطناعي
-    # نرجع النصوص الافتراضية كبادئة
     return {
         "report_type": report_type,
         "default_texts": DEFAULT_REPORT_TEXTS,
@@ -696,7 +766,7 @@ def get_report_texts(report_type: str):
     }
 
 # -----------------------------------------------------
-# الحصول على إدارات التعليم
+# 🏫 الحصول على إدارات التعليم
 # -----------------------------------------------------
 @app.get("/education/administrations")
 def get_education_administrations():
@@ -705,7 +775,7 @@ def get_education_administrations():
     }
 
 # -----------------------------------------------------
-# الحصول على الأدوات التعليمية
+# 🛠️ الحصول على الأدوات التعليمية
 # -----------------------------------------------------
 @app.get("/education/tools")
 def get_educational_tools():
@@ -714,29 +784,27 @@ def get_educational_tools():
     }
 
 # -----------------------------------------------------
-# الذكاء الاصطناعي العام (القديم)
+# 🤖 الذكاء الاصطناعي العام (مع Rate Limit)
 # -----------------------------------------------------
 @app.post("/generate")
 def generate_ai_content(data: AskRequest, x_token: str = Header(..., alias="X-Token")):
     verify_jwt(x_token)
+    rate_limit_guard(x_token)
+    validate_prompt(data.prompt)
 
     try:
         model = pick_gemini_model()
         response = model.generate_content(data.prompt)
         return {"answer": response.text}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        safe_500()
 
 # -----------------------------------------------------
-# تحليل استجابة الذكاء الاصطناعي
+# 🔄 تحليل استجابة الذكاء الاصطناعي
 # -----------------------------------------------------
 def parse_ai_response(response_text: str, report_type: str = "") -> Dict[str, str]:
-    """تحليل النص الذي يرجع من الذكاء الاصطناعي إلى حقول مع إثراء ذكي"""
-    
-    # تنظيف النص
     response_text = response_text.strip()
     
-    # خريطة التعرف على بدايات الحقول
     field_patterns = {
         "goal": ["1.", "١.", "1-", "1 ", "الهدف", "هدف"],
         "summary": ["2.", "٢.", "2-", "2 ", "نبذة", "ملخص", "مختصر"],
@@ -747,17 +815,8 @@ def parse_ai_response(response_text: str, report_type: str = "") -> Dict[str, st
         "recomm": ["7.", "٧.", "7-", "7 ", "توصيات", "اقتراحات", "نصائح"]
     }
     
-    parsed = {
-        "goal": "",
-        "summary": "",
-        "steps": "",
-        "strategies": "",
-        "strengths": "",
-        "improve": "",
-        "recomm": ""
-    }
+    parsed = {key: "" for key in field_patterns}
     
-    # إذا كان النص قصيراً أو غير منظم
     lines = response_text.split('\n')
     current_field = None
     field_content = []
@@ -767,7 +826,6 @@ def parse_ai_response(response_text: str, report_type: str = "") -> Dict[str, st
         if not line:
             continue
             
-        # البحث عن بداية حقل جديد
         found_field = None
         for field, patterns in field_patterns.items():
             for pattern in patterns:
@@ -778,13 +836,10 @@ def parse_ai_response(response_text: str, report_type: str = "") -> Dict[str, st
                 break
         
         if found_field:
-            # حفظ الحقل السابق
             if current_field and field_content:
                 parsed[current_field] = ' '.join(field_content).strip()
             
-            # بدء حقل جديد
             current_field = found_field
-            # إزالة النمط من بداية السطر
             for pattern in field_patterns[found_field]:
                 if line.startswith(pattern):
                     line = line[len(pattern):].strip()
@@ -793,34 +848,30 @@ def parse_ai_response(response_text: str, report_type: str = "") -> Dict[str, st
         elif current_field:
             field_content.append(line)
     
-    # الحقل الأخير
     if current_field and field_content:
         parsed[current_field] = ' '.join(field_content).strip()
     
-    # تطبيق الإثراء الذكي على كل حقل
     for key in parsed:
-        if parsed[key]:  # إذا كان النص غير فارغ
+        if parsed[key]:
             parsed[key] = enrich_and_enforce(parsed[key], 25, 35, report_type)
-        else:
-            # استخدام نصوص افتراضية إذا كان الحقل فارغاً
-            if key in DEFAULT_REPORT_TEXTS:
-                default_text = random.choice(DEFAULT_REPORT_TEXTS[key])
-                parsed[key] = enrich_and_enforce(default_text, 25, 35, report_type)
+        elif key in DEFAULT_REPORT_TEXTS:
+            default_text = random.choice(DEFAULT_REPORT_TEXTS[key])
+            parsed[key] = enrich_and_enforce(default_text, 25, 35, report_type)
     
     return parsed
 
 # -----------------------------------------------------
-# توليد تقرير تعليمي متكامل (الجديد)
+# 📄 توليد تقرير تعليمي متكامل (مع Rate Limit)
 # -----------------------------------------------------
 @app.post("/generate/report")
 def generate_educational_report(data: ReportGenerateRequest, x_token: str = Header(..., alias="X-Token")):
     verify_jwt(x_token)
+    rate_limit_guard(x_token)
     
     if not data.reportType:
         raise HTTPException(status_code=400, detail="نوع التقرير مطلوب")
     
     try:
-        # إنشاء البرومت المتخصص
         prompt = generate_educational_prompt(
             report_type=data.reportType,
             subject=data.subject,
@@ -831,48 +882,44 @@ def generate_educational_report(data: ReportGenerateRequest, x_token: str = Head
             count=data.count
         )
         
-        # استخدام الذكاء الاصطناعي
+        validate_prompt(prompt)
         model = pick_gemini_model()
         response = model.generate_content(prompt)
         
-        # تحليل الاستجابة مع الإثراء الذكي
         ai_text = response.text
         parsed_fields = parse_ai_response(ai_text, data.reportType)
         
         return {
             "success": True,
             "report_type": data.reportType,
-            "parsed_fields": parsed_fields,
-            "raw_response": ai_text
+            "parsed_fields": parsed_fields
         }
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"خطأ في توليد التقرير: {str(e)}")
+        safe_500()
 
 # -----------------------------------------------------
-# تحويل التاريخ الهجري إلى ميلادي
+# 📅 تحويل التاريخ الهجري إلى ميلادي
 # -----------------------------------------------------
 @app.get("/convert/hijri-to-gregorian")
 def convert_hijri_date(hijri_date: str):
-    """تحويل التاريخ الهجري إلى ميلادي (بسيط - للإنتاج تحتاج API حقيقي)"""
     try:
-        # هذا مثال بسيط - للإنتاج تحتاج استخدام API مثل api.aladhan.com
-        # هنا نرجع نفس التاريخ كنموذج
         return {
             "hijri_date": hijri_date,
             "gregorian_date": hijri_date + " (ميلادي)",
             "note": "هذه خدمة تجريبية، للإنتاج استخدم API متخصص"
         }
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"خطأ في تحويل التاريخ: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"خطأ في تحويل التاريخ")
 
 # -----------------------------------------------------
-# استشارة تربوية (إضافية)
+# 💼 استشارة تربوية (مع Rate Limit)
 # -----------------------------------------------------
 @app.post("/consult/educational")
 def educational_consultation(data: AskRequest, x_token: str = Header(..., alias="X-Token")):
-    """استشارة تربوية مع خبير تعليمي"""
     verify_jwt(x_token)
+    rate_limit_guard(x_token)
+    validate_prompt(data.prompt)
     
     consult_prompt = f"""أنت مستشار تربوي محترف مع خبرة 20 سنة في المجال التعليمي.
 الاستشارة المطلوبة: {data.prompt}
@@ -894,20 +941,40 @@ def educational_consultation(data: AskRequest, x_token: str = Header(..., alias=
             "advisor": "خبير تربوي - نظام ناصر التعليمي"
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        safe_500()
 
 # -----------------------------------------------------
-# تحديث الذاكرة (تنظيف الكود المنتهي)
+# 🧹 تحديث الذاكرة (تنظيف الكود المنتهي)
 # -----------------------------------------------------
 @app.on_event("startup")
 async def startup_event():
-    """تنظيف الذاكرة عند بدء التشغيل"""
-    global VALID_CODES
     now = datetime.utcnow()
     expired_codes = [k for k, v in VALID_CODES.items() if v < now]
     for code in expired_codes:
         VALID_CODES.pop(code, None)
+    print(f"[STARTUP] تم تنظيف {len(expired_codes)} كود منتهي")
+
+# -----------------------------------------------------
+# 🧹 تنظيف Rate Limit القديم
+# -----------------------------------------------------
+@app.on_event("startup")
+async def cleanup_rate_limit():
+    global _request_log
+    now = time.time()
+    window_start = now - RATE_WINDOW
+    
+    for token in list(_request_log.keys()):
+        timestamps = [t for t in _request_log[token] if t > window_start]
+        if timestamps:
+            _request_log[token] = timestamps
+        else:
+            _request_log.pop(token, None)
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", 8000)),
+        log_level="info"
+    )
