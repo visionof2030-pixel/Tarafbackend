@@ -763,7 +763,7 @@ async function generate() {
   out.textContent = "جارٍ الاتصال بالسيرفر...";
 
   try {
-    const res = await fetch("/generate-code", {
+    const res = await fetch("https://tarafbackend.onrender.com/generate-code", {
       method: "POST",
       headers: {
         "Content-Type": "application/json"
