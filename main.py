@@ -61,6 +61,7 @@ app.add_middleware(
         "http://127.0.0.1:3000",  # للتطوير المحلي فقط
         "https://nassr-ai-frontend.onrender.com",  # Frontend URL
         "http://localhost:8000",  # للتطوير المحلي
+        "*"  # ⚠️ مؤقت للتجربة فقط
     ],
     allow_credentials=False,
     allow_methods=["POST", "GET", "OPTIONS"],
@@ -789,58 +790,36 @@ async function generate() {
 </html>
 """)
 
-# -----------------------------------------------------
-# 🛡️ توليد كود (مشرف) - محصن
-# -----------------------------------------------------
+# =====================================================
+# 🔐 التعديل الحاسم - generate-code الجديد
+# =====================================================
 @app.post("/generate-code")
 def generate_code(data: dict):
-    """POST بدلاً من GET لأمان أفضل"""
+    """التعديل الحاسم: يرجع التوكن مباشرة بدون كود تفعيل"""
     key = data.get("key")
     duration = data.get("duration")
-    
+
     if key != ADMIN_TOKEN:
         raise HTTPException(status_code=403, detail="Forbidden")
 
     if duration not in DURATIONS:
         raise HTTPException(status_code=400, detail="Invalid duration")
 
-    code = generate_short_code()
-    code_hash = hash_code(code)
-
     expires_at = datetime.utcnow() + DURATIONS[duration]
-    VALID_CODES[code_hash] = expires_at
-
-    return {
-        "activation_code": code,
-        "duration": duration,
-        "expires_at": expires_at.isoformat() + "Z"
-    }
-
-# -----------------------------------------------------
-# 🔑 تفعيل كود
-# -----------------------------------------------------
-@app.post("/activate")
-def activate(data: ActivateRequest):
-    code = data.code.strip()
-    if not code:
-        raise HTTPException(status_code=400, detail="CODE_REQUIRED")
-
-    code_hash = hash_code(code)
-    expires_at = VALID_CODES.get(code_hash)
-
-    if not expires_at:
-        raise HTTPException(status_code=403, detail="INVALID_CODE")
-
-    if expires_at < datetime.utcnow():
-        VALID_CODES.pop(code_hash, None)
-        raise HTTPException(status_code=403, detail="CODE_EXPIRED")
-
     token = create_jwt(expires_at)
 
     return {
         "token": token,
         "expires_at": expires_at.isoformat() + "Z"
     }
+
+# -----------------------------------------------------
+# 🔑 تفعيل كود - محذوف لأنه غير مستخدم الآن
+# -----------------------------------------------------
+# @app.post("/activate")
+# def activate(data: ActivateRequest):
+#     # هذا الـ endpoint تم إزالته من النظام الجديد
+#     raise HTTPException(status_code=404, detail="Endpoint deprecated")
 
 # -----------------------------------------------------
 # ✅ تحقق من التوكن
