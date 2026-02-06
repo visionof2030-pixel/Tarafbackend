@@ -58,7 +58,9 @@ app.add_middleware(
     allow_origins=[
         "https://tarafbackend.onrender.com",
         "http://localhost:3000",  # للتطوير المحلي فقط
-        "http://127.0.0.1:3000"   # للتطوير المحلي فقط
+        "http://127.0.0.1:3000",  # للتطوير المحلي فقط
+        "https://nassr-ai-frontend.onrender.com",  # Frontend URL
+        "http://localhost:8000",  # للتطوير المحلي
     ],
     allow_credentials=False,
     allow_methods=["POST", "GET", "OPTIONS"],
