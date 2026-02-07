@@ -640,11 +640,10 @@ def health():
 @app.post("/activate")
 def activate(data: ActivateRequest):
     code = data.code.strip()
-    if not code:
-        raise HTTPException(status_code=400, detail="CODE_REQUIRED")
+    device_id = data.device_id.strip()
 
-    if not data.device_id:
-        raise HTTPException(status_code=400, detail="DEVICE_REQUIRED")
+    if not code or not device_id:
+        raise HTTPException(status_code=400, detail="CODE_OR_DEVICE_REQUIRED")
 
     code_hash = hash_code(code)
     expires_at = VALID_CODES.get(code_hash)
@@ -656,13 +655,15 @@ def activate(data: ActivateRequest):
         VALID_CODES.pop(code_hash, None)
         raise HTTPException(status_code=403, detail="CODE_EXPIRED")
 
-    token = create_jwt(expires_at, data.device_id)
+    token = create_jwt(expires_at, device_id)
+
+    # 🔒 السطر الحاسم — حذف الكود بعد أول تفعيل
+    VALID_CODES.pop(code_hash, None)
 
     return {
         "token": token,
         "expires_at": expires_at.isoformat() + "Z"
     }
-
 # -----------------------------------------------------
 # تحقق من التوكن
 # -----------------------------------------------------
