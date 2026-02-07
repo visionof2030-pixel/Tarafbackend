@@ -15,12 +15,21 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import uvicorn
+from dotenv import load_dotenv
 
 # =====================================================
-# ENV
+# ENV (آمن – بدون قيم افتراضية)
 # =====================================================
-JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_ME_SECRET")
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "FahadJassar14061436")
+load_dotenv()
+
+JWT_SECRET = os.getenv("JWT_SECRET")
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")
+
+if not JWT_SECRET:
+    raise RuntimeError("JWT_SECRET is missing")
+
+if not ADMIN_TOKEN:
+    raise RuntimeError("ADMIN_TOKEN is missing")
 
 GEMINI_KEYS = [
     os.getenv("GEMINI_API_KEY_1"),
@@ -278,7 +287,7 @@ REPORTS_BY_CATEGORY = {
         "تقرير تبادل الخبرات",
         "تقرير بناء المسار المهني"
     ],
-    "تقareير توظيف التكنولوجيا": [
+    "تقارير توظيف التكنولوجيا": [
         "تقرير المحتوى الرقمي المنتج",
         "تقرير إنتاج المحتوى الرقمي",
         "تقرير استخدام أنظمة إدارة التعلم",
@@ -613,29 +622,6 @@ def health():
     }
 
 # -----------------------------------------------------
-# توليد كود (مشرف)
-# -----------------------------------------------------
-@app.get("/generate-code")
-def generate_code(key: str, duration: str):
-    if key != ADMIN_TOKEN:
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-    if duration not in DURATIONS:
-        raise HTTPException(status_code=400, detail="Invalid duration")
-
-    code = generate_short_code()
-    code_hash = hash_code(code)
-
-    expires_at = datetime.utcnow() + DURATIONS[duration]
-    VALID_CODES[code_hash] = expires_at
-
-    return {
-        "activation_code": code,
-        "duration": duration,
-        "expires_at": expires_at.isoformat() + "Z"
-    }
-
-# -----------------------------------------------------
 # تفعيل كود
 # -----------------------------------------------------
 @app.post("/activate")
@@ -667,6 +653,32 @@ def activate(data: ActivateRequest):
 @app.get("/verify")
 def verify(user = Depends(get_current_user)):
     return {"status": "ok", "expires_at": user.get("exp")}
+
+# -----------------------------------------------------
+# توليد كود (مشرف فقط)
+# -----------------------------------------------------
+@app.post("/generate-code")
+def generate_code(
+    duration: str,
+    x_admin_token: str = Header(..., alias="X-Admin-Token")
+):
+    if x_admin_token != ADMIN_TOKEN:
+        raise HTTPException(status_code=403, detail="FORBIDDEN")
+
+    if duration not in DURATIONS:
+        raise HTTPException(status_code=400, detail="INVALID_DURATION")
+
+    code = generate_short_code()
+    code_hash = hash_code(code)
+
+    expires_at = datetime.utcnow() + DURATIONS[duration]
+    VALID_CODES[code_hash] = expires_at
+
+    return {
+        "activation_code": code,
+        "duration": duration,
+        "expires_at": expires_at.isoformat() + "Z"
+    }
 
 # -----------------------------------------------------
 # الحصول على أنواع التقارير
