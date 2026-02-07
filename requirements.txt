@@ -1,4 +1,6 @@
 fastapi
-uvicorn
+uvicorn[standard]
 pyjwt
 google-generativeai
+python-dotenv
+aiohttp
