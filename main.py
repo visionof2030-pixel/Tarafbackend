@@ -64,8 +64,10 @@ class AskRequest(BaseModel):
     prompt: str
     reportData: Optional[Dict] = None
 
+# 1️⃣ تعديل موديل التفعيل
 class ActivateRequest(BaseModel):
     code: str
+    device_id: str
 
 class ReportGenerateRequest(BaseModel):
     reportType: str
@@ -429,9 +431,12 @@ def generate_short_code():
 def hash_code(code: str):
     return hashlib.sha256(code.encode()).hexdigest()
 
-def create_jwt(expires_at: datetime):
+# 2️⃣ تعديل إنشاء JWT (ربط بالجهاز)
+def create_jwt(expires_at: datetime, device_id: str):
     payload = {
         "type": "activation",
+        "device": device_id,
+        "iat": datetime.utcnow(),
         "exp": expires_at
     }
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
@@ -445,8 +450,16 @@ def verify_jwt(token: str):
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="INVALID_TOKEN")
 
-async def get_current_user(x_token: str = Header(..., alias="X-Token")):
+# 4️⃣ تعديل التحقق من المستخدم (Device Lock)
+async def get_current_user(
+    x_token: str = Header(..., alias="X-Token"),
+    x_device_id: str = Header(..., alias="X-Device-Id")
+):
     payload = verify_jwt(x_token)
+
+    if payload.get("device") != x_device_id:
+        raise HTTPException(status_code=403, detail="DEVICE_MISMATCH")
+
     return payload
 
 # =====================================================
@@ -622,13 +635,16 @@ def health():
     }
 
 # -----------------------------------------------------
-# تفعيل كود
+# 3️⃣ تعديل endpoint /activate
 # -----------------------------------------------------
 @app.post("/activate")
 def activate(data: ActivateRequest):
     code = data.code.strip()
     if not code:
         raise HTTPException(status_code=400, detail="CODE_REQUIRED")
+
+    if not data.device_id:
+        raise HTTPException(status_code=400, detail="DEVICE_REQUIRED")
 
     code_hash = hash_code(code)
     expires_at = VALID_CODES.get(code_hash)
@@ -640,7 +656,7 @@ def activate(data: ActivateRequest):
         VALID_CODES.pop(code_hash, None)
         raise HTTPException(status_code=403, detail="CODE_EXPIRED")
 
-    token = create_jwt(expires_at)
+    token = create_jwt(expires_at, data.device_id)
 
     return {
         "token": token,
@@ -652,7 +668,7 @@ def activate(data: ActivateRequest):
 # -----------------------------------------------------
 @app.get("/verify")
 def verify(user = Depends(get_current_user)):
-    return {"status": "ok", "expires_at": user.get("exp")}
+    return {"status": "ok", "expires_at": user.get("exp"), "device": user.get("device")}
 
 # -----------------------------------------------------
 # توليد كود (مشرف فقط)
@@ -1176,6 +1192,29 @@ def get_system_info():
         ],
         "last_updated": "2026-02-07"
     }
+
+# -----------------------------------------------------
+# نقطة نهاية جديدة للتحقق من جهاز معين
+# -----------------------------------------------------
+@app.get("/device/check")
+def check_device(
+    device_id: str,
+    user = Depends(get_current_user)
+):
+    """التحقق من تطابق الجهاز مع المستخدم"""
+    user_device = user.get("device", "")
+    
+    if user_device == device_id:
+        return {
+            "status": "valid",
+            "message": "الجهاز مطابق",
+            "device_id": device_id
+        }
+    else:
+        raise HTTPException(
+            status_code=403,
+            detail="لا يمكن الوصول من هذا الجهاز"
+        )
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
