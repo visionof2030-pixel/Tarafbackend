@@ -2,29 +2,25 @@ import os
 import random
 import hashlib
 import secrets
-import time
+import json
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
+from pathlib import Path
 
 import jwt
 import google.generativeai as genai
-
-from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi import FastAPI, HTTPException, Header, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
+import uvicorn
 
 # =====================================================
-# 🔐 ENV SECRETS (إجباري)
+# ENV
 # =====================================================
-JWT_SECRET = os.getenv("JWT_SECRET")          # لا تضع قيمة افتراضية
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")        # لا تضع قيمة افتراضية
-
-if not JWT_SECRET or len(JWT_SECRET) < 32:
-    raise RuntimeError("JWT_SECRET is missing or too weak")
-
-if not ADMIN_TOKEN:
-    raise RuntimeError("ADMIN_TOKEN is missing")
+JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_ME_SECRET")
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "FahadJassar14061436")
 
 GEMINI_KEYS = [
     os.getenv("GEMINI_API_KEY_1"),
@@ -41,43 +37,19 @@ if not GEMINI_KEYS:
     raise RuntimeError("No Gemini API Keys found")
 
 # =====================================================
-# 🚀 APP INITIALIZATION
+# APP
 # =====================================================
-app = FastAPI(
-    title="Nassr AI Backend - تقارير تعليمية",
-    version="2.0.0",
-    docs_url=None,  # تعطيل Swagger في Production
-    redoc_url=None  # تعطيل ReDoc في Production
-)
+app = FastAPI(title="Nassr AI Backend - تقارير تعليمية")
 
-# =====================================================
-# 🔒 CORS (مقيّد على الدومين فقط)
-# =====================================================
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://tarafbackend.onrender.com",
-        "http://localhost:3000",  # للتطوير المحلي فقط
-        "http://127.0.0.1:3000",  # للتطوير المحلي فقط
-        "https://nassr-ai-frontend.onrender.com",  # Frontend URL
-        "http://localhost:8000",  # للتطوير المحلي
-        "*"  # ⚠️ مؤقت للتجربة فقط
-    ],
-    allow_credentials=False,
-    allow_methods=["POST", "GET", "OPTIONS"],
-    allow_headers=["X-Token", "Content-Type", "Authorization"],
-    max_age=600
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # =====================================================
-# ⚡ RATE LIMIT STORAGE (بدون DB)
-# =====================================================
-RATE_LIMIT = 20            # 20 طلب
-RATE_WINDOW = 10           # خلال 10 ثواني
-_request_log = {}          # token -> timestamps
-
-# =====================================================
-# 📦 MODELS
+# MODELS
 # =====================================================
 class AskRequest(BaseModel):
     prompt: str
@@ -95,13 +67,48 @@ class ReportGenerateRequest(BaseModel):
     place: Optional[str] = ""
     count: Optional[str] = ""
 
-# =====================================================
-# 💾 STORAGE (مؤقت - in memory)
-# =====================================================
-VALID_CODES = {}  # code_hash -> expires_at
+class SaveTeacherRequest(BaseModel):
+    education: Optional[str] = ""
+    school: Optional[str] = ""
+    grade: Optional[str] = ""
+    subject: Optional[str] = ""
+    target: Optional[str] = ""
+    place: Optional[str] = ""
+    lesson: Optional[str] = ""
+    teacher: Optional[str] = ""
+    principal: Optional[str] = ""
+    teacherType: Optional[str] = "المعلم"
+    principalType: Optional[str] = "المدير"
+    term: Optional[str] = ""
+    count: Optional[str] = ""
+    manualTitle: Optional[str] = ""
+    manualHijriDate: Optional[str] = ""
+    manualGregorianDate: Optional[str] = ""
+    tools: Optional[List[str]] = []
+    goal: Optional[str] = ""
+    summary: Optional[str] = ""
+    steps: Optional[str] = ""
+    strategies: Optional[str] = ""
+    strengths: Optional[str] = ""
+    improve: Optional[str] = ""
+    recomm: Optional[str] = ""
+
+class SupportRequest(BaseModel):
+    name: str
+    phone: str
+    issue: str
 
 # =====================================================
-# 📊 أنواع التقارير
+# STORAGE (مؤقت - in memory)
+# =====================================================
+# code_hash -> expires_at
+VALID_CODES = {}
+
+# تخزين بيانات المستخدمين (في الواقع يمكن استخدام قاعدة بيانات)
+USER_DATA = {}
+
+# =====================================================
+# أنواع التقارير (تم نقلها من الفرونت إند)
 # =====================================================
 LINGUISTIC_ENRICHMENT = [
     "بما يعزز من فاعلية العملية التعليمية ويرتقي بمستوى الممارسات الصفية",
@@ -271,7 +278,7 @@ REPORTS_BY_CATEGORY = {
         "تقرير تبادل الخبرات",
         "تقرير بناء المسار المهني"
     ],
-    "تقارير توظيف التكنولوجيا": [
+    "تقareير توظيف التكنولوجيا": [
         "تقرير المحتوى الرقمي المنتج",
         "تقرير إنتاج المحتوى الرقمي",
         "تقرير استخدام أنظمة إدارة التعلم",
@@ -378,7 +385,7 @@ EDUCATIONAL_TOOLS = [
 ]
 
 # =====================================================
-# إدارات التعليم
+# إدارات التعليم (من الفرونت إند)
 # =====================================================
 EDUCATION_ADMINISTRATIONS = [
     "الإدارة العامة للتعليم بمنطقة مكة المكرمة",
@@ -400,7 +407,7 @@ EDUCATION_ADMINISTRATIONS = [
 ]
 
 # =====================================================
-# 🔧 HELPERS
+# HELPERS
 # =====================================================
 def pick_gemini_model():
     key = random.choice(GEMINI_KEYS)
@@ -413,58 +420,28 @@ def generate_short_code():
 def hash_code(code: str):
     return hashlib.sha256(code.encode()).hexdigest()
 
-# =====================================================
-# 🔐 JWT FIX — النسخة الصحيحة المستقرة
-# =====================================================
-
 def create_jwt(expires_at: datetime):
     payload = {
-        "t": "a",  # activation token (مختصر)
-        "exp": int(expires_at.timestamp())  # MUST be int (Unix timestamp)
+        "type": "activation",
+        "exp": expires_at
     }
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
 def verify_jwt(token: str):
     try:
-        payload = jwt.decode(
-            token,
-            JWT_SECRET,
-            algorithms=["HS256"],
-            options={"require": ["exp"]}
-        )
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
         return payload
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="TOKEN_EXPIRED")
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="INVALID_TOKEN")
 
-# =====================================================
-# ⚡ RATE LIMIT GUARD
-# =====================================================
-def rate_limit_guard(token: str):
-    now = time.time()
-    window_start = now - RATE_WINDOW
-
-    timestamps = _request_log.get(token, [])
-    timestamps = [t for t in timestamps if t > window_start]
-
-    if len(timestamps) >= RATE_LIMIT:
-        raise HTTPException(status_code=429, detail="TOO_MANY_REQUESTS")
-
-    timestamps.append(now)
-    _request_log[token] = timestamps
+async def get_current_user(x_token: str = Header(..., alias="X-Token")):
+    payload = verify_jwt(x_token)
+    return payload
 
 # =====================================================
-# 📏 VALIDATION HELPERS
-# =====================================================
-MAX_PROMPT_LENGTH = 4000
-
-def validate_prompt(prompt: str):
-    if not prompt or len(prompt) > MAX_PROMPT_LENGTH:
-        raise HTTPException(status_code=400, detail="INVALID_PROMPT")
-
-# =====================================================
-# 🕒 DURATIONS
+# DURATIONS
 # =====================================================
 DURATIONS = {
     "5m": timedelta(minutes=5),
@@ -480,7 +457,7 @@ DURATIONS = {
 }
 
 # =====================================================
-# 🤖 البرومت المتخصص للتقارير التعليمية
+# البرومت المتخصص للتقارير التعليمية
 # =====================================================
 def generate_educational_prompt(report_type: str, subject: str = "", lesson: str = "", 
                                grade: str = "", target: str = "", place: str = "", count: str = "") -> str:
@@ -527,25 +504,18 @@ def generate_educational_prompt(report_type: str, subject: str = "", lesson: str
 يرجى تقديم الإجابة باللغة العربية الفصحى، وتنظيمها بحيث يكون كل حقل في سطر منفصل يبدأ برقمه فقط دون ذكر العنوان."""
 
 # =====================================================
-# 🎨 دالة الإثراء الذكي
+# دالة الإثراء الذكي
 # =====================================================
 def enrich_and_enforce(text: str, min_words=25, max_words=35, report_type: str = "") -> str:
     """
     إثراء النص وتطبيق الحد الأدنى والأقصى للكلمات بشكل ذكي
     """
-    if not text or text.strip() == "":
-        default_texts = [
-            "تنفيذ الأنشطة التعليمية المخططة وفق أهداف الدرس والمعايير التربوية المعتمدة",
-            "تطبيق استراتيجيات تعليمية متنوعة لتحقيق نواتج التعلم المستهدفة بشكل فعال",
-            "توظيف الوسائل التعليمية المناسبة لتعزيز فهم الطلاب وتفعيل مشاركتهم في الدرس"
-        ]
-        text = random.choice(default_texts)
-    
     words = text.split()
     
     if len(words) == 0:
         return text
     
+    # تحليل السياق من نوع التقرير
     context_keywords = {
         "تقرير علاجي": ["العلاج", "الدعم", "تحسين", "تقدم"],
         "تقرير سلوكي": ["السلوك", "تحفيز", "تعزيز", "مكافأة"],
@@ -553,18 +523,24 @@ def enrich_and_enforce(text: str, min_words=25, max_words=35, report_type: str =
         "تقرير نشاط": ["نشاط", "مشاركة", "تفاعل", "تطبيق"],
     }
     
+    # تحديد الكلمات الإثرائية المناسبة للسياق
     enrichment_phrases = []
     for keyword, phrases in context_keywords.items():
         if keyword in report_type:
             enrichment_phrases.extend(phrases)
     
+    # إذا لم نجد سياق محدد، نستخدم الإثراء العام
     if not enrichment_phrases:
         enrichment_phrases = LINGUISTIC_ENRICHMENT
     
+    # إثراء النص إذا كان قصيراً
     if len(words) < min_words:
+        # احتساب عدد الكلمات المطلوبة
         words_needed = min_words - len(words)
         
-        if len(words) < 15:
+        # إضافة عبارات إثرائية ذكية
+        if len(words) < 15:  # إذا كان النص قصير جداً
+            # إضافة عبارات تربوية محسنة
             enhancements = [
                 "بما يعزز من جودة الممارسة التعليمية وينسجم مع أهداف المنهج",
                 "وذلك لتحقيق نواتج التعلم المستهدفة ورفع مستوى التحصيل الدراسي",
@@ -579,20 +555,26 @@ def enrich_and_enforce(text: str, min_words=25, max_words=35, report_type: str =
                     text += " " + enhancement
                     words = text.split()
         
+        # إذا مازال النقص موجوداً
         while len(words) < min_words:
+            # اختيار عبارة إثرائية مناسبة
             phrase = random.choice(enrichment_phrases)
+            
+            # التأكد من أن الإضافة تتناسب مع سياق النص
             if not any(word in text for word in phrase.split()[:3]):
                 text += " " + phrase
                 words = text.split()
     
+    # تقليم النص إذا تجاوز الحد الأقصى
     if len(words) > max_words:
+        # المحاولة لتقليم النص بشكل ذكي
         sentences = text.split('،')
         if len(sentences) > 1:
             trimmed_text = ""
             current_words = 0
             for sentence in sentences:
                 sentence_words = sentence.split()
-                if current_words + len(sentence_words) <= max_words - 5:
+                if current_words + len(sentence_words) <= max_words - 5:  # ترك مساحة للختام
                     if trimmed_text:
                         trimmed_text += "، " + sentence
                     else:
@@ -605,51 +587,21 @@ def enrich_and_enforce(text: str, min_words=25, max_words=35, report_type: str =
                 text = trimmed_text + "، مما يسهم في تحقيق الأهداف التربوية المنشودة."
                 words = text.split()
         
+        # إذا مازال الطول زائداً، قص الكلمات الزائدة
         if len(words) > max_words:
             text = " ".join(words[:max_words])
     
+    # تحسين جودة النص النهائي
     text = text.replace("  ", " ").strip()
     
+    # إضافة نقطة نهائية إذا لم تكن موجودة
     if text and text[-1] not in [".", "!", "؟"]:
         text += "."
     
     return text
 
 # =====================================================
-# 🛡️ GENERIC ERROR RESPONSES
-# =====================================================
-def safe_500():
-    raise HTTPException(status_code=500, detail="INTERNAL_ERROR")
-
-# =====================================================
-# 🚦 MIDDLEWARE FOR LOGGING
-# =====================================================
-@app.middleware("http")
-async def log_requests(request: Request, call_next):
-    start_time = time.time()
-    
-    try:
-        response = await call_next(request)
-        
-        process_time = time.time() - start_time
-        
-        log_data = {
-            "method": request.method,
-            "path": request.url.path,
-            "status_code": response.status_code,
-            "response_time": f"{process_time:.3f}s",
-            "timestamp": datetime.utcnow().isoformat()
-        }
-        
-        print(f"[LOG] {log_data}")
-        
-        return response
-    except Exception as e:
-        print(f"[ERROR] {request.method} {request.url.path} - {type(e).__name__}")
-        raise
-
-# =====================================================
-# 🚀 ROUTES
+# ROUTES
 # =====================================================
 
 @app.get("/")
@@ -657,155 +609,51 @@ def health():
     return {
         "status": "healthy",
         "time": datetime.utcnow().isoformat(),
-        "service": "ناصر - أداة إصدار التقارير التعليمية",
-        "version": "2.0.0"
+        "service": "ناصر - أداة إصدار التقارير التعليمية"
     }
 
-# =====================================================
-# 🖥️ ADMIN PANEL (NO CORS ISSUES)
-# =====================================================
-@app.get("/admin", include_in_schema=False)
-def admin_panel():
-    return HTMLResponse("""
-<!DOCTYPE html>
-<html lang="ar">
-<head>
-<meta charset="UTF-8">
-<title>Admin Panel</title>
-
-<style>
-body {
-  background:#0f172a;
-  color:#ffffff;
-  font-family: system-ui, -apple-system;
-  display:flex;
-  justify-content:center;
-  align-items:center;
-  height:100vh;
-  margin:0;
-}
-
-.box {
-  background:#020617;
-  padding:30px;
-  border-radius:14px;
-  width:320px;
-  box-shadow:0 20px 40px rgba(0,0,0,.6);
-}
-
-h3 {
-  text-align:center;
-  margin-bottom:20px;
-}
-
-input, select, button {
-  width:100%;
-  margin-top:12px;
-  padding:12px;
-  border-radius:10px;
-  border:none;
-  outline:none;
-  font-size:14px;
-}
-
-input, select {
-  background:#020617;
-  color:#fff;
-  border:1px solid #1e293b;
-}
-
-button {
-  background:#2563eb;
-  color:#fff;
-  font-weight:bold;
-  cursor:pointer;
-}
-
-button:hover {
-  background:#1d4ed8;
-}
-
-pre {
-  margin-top:15px;
-  background:#020617;
-  padding:12px;
-  border-radius:10px;
-  font-size:13px;
-  white-space:pre-wrap;
-  word-break:break-word;
-  border:1px solid #1e293b;
-}
-</style>
-</head>
-
-<body>
-<div class="box">
-
-  <h3>Admin Panel</h3>
-
-  <input id="key" type="password" placeholder="ADMIN TOKEN">
-
-  <select id="duration">
-    <option value="5m">5 دقائق</option>
-    <option value="30m">30 دقيقة</option>
-    <option value="1h">ساعة</option>
-    <option value="1d">يوم</option>
-    <option value="7d">7 أيام</option>
-    <option value="30d">30 يوم</option>
-  </select>
-
-  <button onclick="generate()">توليد كود</button>
-
-  <pre id="out"></pre>
-
-</div>
-
-<script>
-async function generate() {
-  const out = document.getElementById("out");
-  out.textContent = "جارٍ الاتصال بالسيرفر...";
-
-  try {
-    const res = await fetch("https://tarafbackend.onrender.com/generate-code", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        key: document.getElementById("key").value,
-        duration: document.getElementById("duration").value
-      })
-    });
-
-    const data = await res.json();
-    out.textContent = JSON.stringify(data, null, 2);
-
-  } catch (e) {
-    out.textContent = "❌ فشل الاتصال بالسيرفر";
-  }
-}
-</script>
-
-</body>
-</html>
-""")
-
-# =====================================================
-# 🔐 التعديل الحاسم - generate-code الجديد
-# =====================================================
-@app.post("/generate-code")
-def generate_code(data: dict):
-    """التعديل الحاسم: يرجع التوكن مباشرة بدون كود تفعيل"""
-    key = data.get("key")
-    duration = data.get("duration")
-
+# -----------------------------------------------------
+# توليد كود (مشرف)
+# -----------------------------------------------------
+@app.get("/generate-code")
+def generate_code(key: str, duration: str):
     if key != ADMIN_TOKEN:
         raise HTTPException(status_code=403, detail="Forbidden")
 
     if duration not in DURATIONS:
         raise HTTPException(status_code=400, detail="Invalid duration")
 
+    code = generate_short_code()
+    code_hash = hash_code(code)
+
     expires_at = datetime.utcnow() + DURATIONS[duration]
+    VALID_CODES[code_hash] = expires_at
+
+    return {
+        "activation_code": code,
+        "duration": duration,
+        "expires_at": expires_at.isoformat() + "Z"
+    }
+
+# -----------------------------------------------------
+# تفعيل كود
+# -----------------------------------------------------
+@app.post("/activate")
+def activate(data: ActivateRequest):
+    code = data.code.strip()
+    if not code:
+        raise HTTPException(status_code=400, detail="CODE_REQUIRED")
+
+    code_hash = hash_code(code)
+    expires_at = VALID_CODES.get(code_hash)
+
+    if not expires_at:
+        raise HTTPException(status_code=403, detail="INVALID_CODE")
+
+    if expires_at < datetime.utcnow():
+        VALID_CODES.pop(code_hash, None)
+        raise HTTPException(status_code=403, detail="CODE_EXPIRED")
+
     token = create_jwt(expires_at)
 
     return {
@@ -814,33 +662,25 @@ def generate_code(data: dict):
     }
 
 # -----------------------------------------------------
-# 🔑 تفعيل كود - محذوف لأنه غير مستخدم الآن
-# -----------------------------------------------------
-# @app.post("/activate")
-# def activate(data: ActivateRequest):
-#     # هذا الـ endpoint تم إزالته من النظام الجديد
-#     raise HTTPException(status_code=404, detail="Endpoint deprecated")
-
-# -----------------------------------------------------
-# ✅ تحقق من التوكن
+# تحقق من التوكن
 # -----------------------------------------------------
 @app.get("/verify")
-def verify(x_token: str = Header(..., alias="X-Token")):
-    verify_jwt(x_token)
-    return {"status": "ok"}
+def verify(user = Depends(get_current_user)):
+    return {"status": "ok", "expires_at": user.get("exp")}
 
 # -----------------------------------------------------
-# 📂 الحصول على أنواع التقارير
+# الحصول على أنواع التقارير
 # -----------------------------------------------------
 @app.get("/reports/categories")
 def get_report_categories():
     return {
         "categories": list(REPORTS_BY_CATEGORY.keys()),
-        "reports_by_category": REPORTS_BY_CATEGORY
+        "reports_by_category": REPORTS_BY_CATEGORY,
+        "all_reports": [report for category in REPORTS_BY_CATEGORY.values() for report in category]
     }
 
 # -----------------------------------------------------
-# 🔍 البحث في التقارير
+# البحث في التقارير
 # -----------------------------------------------------
 @app.get("/reports/search")
 def search_reports(query: str):
@@ -861,18 +701,7 @@ def search_reports(query: str):
     return {"results": results}
 
 # -----------------------------------------------------
-# 📝 الحصول على نصوص تقرير معين
-# -----------------------------------------------------
-@app.get("/reports/texts/{report_type}")
-def get_report_texts(report_type: str):
-    return {
-        "report_type": report_type,
-        "default_texts": DEFAULT_REPORT_TEXTS,
-        "message": "استخدم /generate/report للحصول على نصوص مخصصة بالذكاء الاصطناعي"
-    }
-
-# -----------------------------------------------------
-# 🏫 الحصول على إدارات التعليم
+# الحصول على إدارات التعليم
 # -----------------------------------------------------
 @app.get("/education/administrations")
 def get_education_administrations():
@@ -881,7 +710,7 @@ def get_education_administrations():
     }
 
 # -----------------------------------------------------
-# 🛠️ الحصول على الأدوات التعليمية
+# الحصول على الأدوات التعليمية
 # -----------------------------------------------------
 @app.get("/education/tools")
 def get_educational_tools():
@@ -890,94 +719,117 @@ def get_educational_tools():
     }
 
 # -----------------------------------------------------
-# 🤖 الذكاء الاصطناعي العام (مع Rate Limit)
+# الذكاء الاصطناعي العام
 # -----------------------------------------------------
 @app.post("/generate")
-def generate_ai_content(data: AskRequest, x_token: str = Header(..., alias="X-Token")):
-    verify_jwt(x_token)
-    rate_limit_guard(x_token)
-    validate_prompt(data.prompt)
-
+def generate_ai_content(data: AskRequest, user = Depends(get_current_user)):
     try:
         model = pick_gemini_model()
         response = model.generate_content(data.prompt)
         return {"answer": response.text}
     except Exception as e:
-        safe_500()
+        raise HTTPException(status_code=500, detail=str(e))
 
 # -----------------------------------------------------
-# 🔄 تحليل استجابة الذكاء الاصطناعي
+# تحليل استجابة الذكاء الاصطناعي
 # -----------------------------------------------------
 def parse_ai_response(response_text: str, report_type: str = "") -> Dict[str, str]:
-    response_text = response_text.strip()
-    
-    field_patterns = {
-        "goal": ["1.", "١.", "1-", "1 ", "الهدف", "هدف"],
-        "summary": ["2.", "٢.", "2-", "2 ", "نبذة", "ملخص", "مختصر"],
-        "steps": ["3.", "٣.", "3-", "3 ", "إجراءات", "خطوات", "تنفيذ"],
-        "strategies": ["4.", "٤.", "4-", "4 ", "استراتيجيات", "طرق", "أساليب"],
-        "strengths": ["5.", "٥.", "5-", "5 ", "نقاط القوة", "قوة", "إيجابيات"],
-        "improve": ["6.", "٦.", "6-", "6 ", "نقاط التحسين", "تحسين", "تطوير"],
-        "recomm": ["7.", "٧.", "7-", "7 ", "توصيات", "اقتراحات", "نصائح"]
-    }
-    
-    parsed = {key: "" for key in field_patterns}
+    """تحليل النص الذي يرجع من الذكاء الاصطناعي إلى حقول مع إثراء ذكي"""
     
     lines = response_text.split('\n')
+    parsed = {
+        "goal": "",
+        "summary": "",
+        "steps": "",
+        "strategies": "",
+        "strengths": "",
+        "improve": "",
+        "recomm": ""
+    }
+    
     current_field = None
     field_content = []
     
     for line in lines:
         line = line.strip()
-        if not line:
-            continue
-            
-        found_field = None
-        for field, patterns in field_patterns.items():
-            for pattern in patterns:
-                if line.startswith(pattern) or pattern in line[:10]:
-                    found_field = field
-                    break
-            if found_field:
-                break
         
-        if found_field:
+        # البحث عن بداية حقل جديد
+        if line.startswith('1.') or line.startswith('١.'):
             if current_field and field_content:
                 parsed[current_field] = ' '.join(field_content).strip()
+            current_field = "goal"
+            field_content = [line[2:].strip()]
             
-            current_field = found_field
-            for pattern in field_patterns[found_field]:
-                if line.startswith(pattern):
-                    line = line[len(pattern):].strip()
-                    break
-            field_content = [line] if line else []
-        elif current_field:
+        elif line.startswith('2.') or line.startswith('٢.'):
+            if current_field and field_content:
+                parsed[current_field] = ' '.join(field_content).strip()
+            current_field = "summary"
+            field_content = [line[2:].strip()]
+            
+        elif line.startswith('3.') or line.startswith('٣.'):
+            if current_field and field_content:
+                parsed[current_field] = ' '.join(field_content).strip()
+            current_field = "steps"
+            field_content = [line[2:].strip()]
+            
+        elif line.startswith('4.') or line.startswith('٤.'):
+            if current_field and field_content:
+                parsed[current_field] = ' '.join(field_content).strip()
+            current_field = "strategies"
+            field_content = [line[2:].strip()]
+            
+        elif line.startswith('5.') or line.startswith('٥.'):
+            if current_field and field_content:
+                parsed[current_field] = ' '.join(field_content).strip()
+            current_field = "strengths"
+            field_content = [line[2:].strip()]
+            
+        elif line.startswith('6.') or line.startswith('٦.'):
+            if current_field and field_content:
+                parsed[current_field] = ' '.join(field_content).strip()
+            current_field = "improve"
+            field_content = [line[2:].strip()]
+            
+        elif line.startswith('7.') or line.startswith('٧.'):
+            if current_field and field_content:
+                parsed[current_field] = ' '.join(field_content).strip()
+            current_field = "recomm"
+            field_content = [line[2:].strip()]
+            
+        elif current_field and line and not line.startswith(('1','2','3','4','5','6','7','١','٢','٣','٤','٥','٦','٧')):
             field_content.append(line)
     
+    # الحقل الأخير
     if current_field and field_content:
         parsed[current_field] = ' '.join(field_content).strip()
     
+    # تطبيق الإثراء الذكي على كل حقل
     for key in parsed:
-        if parsed[key]:
-            parsed[key] = enrich_and_enforce(parsed[key], 25, 35, report_type)
-        elif key in DEFAULT_REPORT_TEXTS:
-            default_text = random.choice(DEFAULT_REPORT_TEXTS[key])
-            parsed[key] = enrich_and_enforce(default_text, 25, 35, report_type)
+        if parsed[key]:  # إذا كان النص غير فارغ
+            parsed[key] = enrich_and_enforce(parsed[key], 25, 30, report_type)
+    
+    # إذا فشل التحليل، نستخدم النصوص الافتراضية مع الإثراء
+    if not any(parsed.values()):
+        for key in parsed:
+            if key in DEFAULT_REPORT_TEXTS:
+                parsed[key] = enrich_and_enforce(
+                    random.choice(DEFAULT_REPORT_TEXTS[key]), 
+                    25, 35, 
+                    report_type
+                )
     
     return parsed
 
 # -----------------------------------------------------
-# 📄 توليد تقرير تعليمي متكامل (مع Rate Limit)
+# توليد تقرير تعليمي متكامل
 # -----------------------------------------------------
 @app.post("/generate/report")
-def generate_educational_report(data: ReportGenerateRequest, x_token: str = Header(..., alias="X-Token")):
-    verify_jwt(x_token)
-    rate_limit_guard(x_token)
-    
+def generate_educational_report(data: ReportGenerateRequest, user = Depends(get_current_user)):
     if not data.reportType:
         raise HTTPException(status_code=400, detail="نوع التقرير مطلوب")
     
     try:
+        # إنشاء البرومت المتخصص
         prompt = generate_educational_prompt(
             report_type=data.reportType,
             subject=data.subject,
@@ -988,45 +840,285 @@ def generate_educational_report(data: ReportGenerateRequest, x_token: str = Head
             count=data.count
         )
         
-        validate_prompt(prompt)
+        # استخدام الذكاء الاصطناعي
         model = pick_gemini_model()
         response = model.generate_content(prompt)
         
+        # تحليل الاستجابة مع الإثراء الذكي
         ai_text = response.text
         parsed_fields = parse_ai_response(ai_text, data.reportType)
         
         return {
             "success": True,
             "report_type": data.reportType,
-            "parsed_fields": parsed_fields
+            "parsed_fields": parsed_fields,
+            "raw_response": ai_text
         }
         
     except Exception as e:
-        safe_500()
+        raise HTTPException(status_code=500, detail=f"خطأ في توليد التقرير: {str(e)}")
 
 # -----------------------------------------------------
-# 📅 تحويل التاريخ الهجري إلى ميلادي
+# تحويل التاريخ الهجري إلى ميلادي
 # -----------------------------------------------------
 @app.get("/convert/hijri-to-gregorian")
-def convert_hijri_date(hijri_date: str):
+async def convert_hijri_date(hijri_date: str):
+    """تحويل التاريخ الهجري إلى ميلادي باستخدام API حقيقي"""
     try:
+        # تحويل الأرقام العربية إلى إنجليزية
+        arabic_to_english = {
+            '٠': '0', '١': '1', '٢': '2', '٣': '3', '٤': '4',
+            '٥': '5', '٦': '6', '٧': '7', '٨': '8', '٩': '9'
+        }
+        
+        clean_date = hijri_date
+        for arabic, english in arabic_to_english.items():
+            clean_date = clean_date.replace(arabic, english)
+        
+        date_parts = clean_date.split('/')
+        if len(date_parts) != 3:
+            raise ValueError("صيغة التاريخ غير صحيحة. استخدم: YYYY/MM/DD")
+        
+        year, month, day = date_parts
+        
+        # استخدام API متخصص لتحويل التاريخ
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f'https://api.aladhan.com/v1/hToG?date={day}-{month}-{year}') as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data['code'] == 200:
+                        gregorian = data['data']['gregorian']
+                        gregorian_date = f"{gregorian['day']}/{gregorian['month']['number']}/{gregorian['year']}"
+                        
+                        # تحويل الأرقام الإنجليزية إلى عربية للعرض
+                        english_to_arabic = {v: k for k, v in arabic_to_english.items()}
+                        arabic_gregorian = gregorian_date
+                        for english, arabic in english_to_arabic.items():
+                            arabic_gregorian = arabic_gregorian.replace(english, arabic)
+                        
+                        return {
+                            "hijri_date": hijri_date,
+                            "gregorian_date": arabic_gregorian,
+                            "english_gregorian": gregorian_date
+                        }
+        
         return {
             "hijri_date": hijri_date,
-            "gregorian_date": hijri_date + " (ميلادي)",
-            "note": "هذه خدمة تجريبية، للإنتاج استخدم API متخصص"
+            "gregorian_date": hijri_date,
+            "note": "تعذر التحويل، تم استخدام التاريخ المدخل"
         }
+        
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"خطأ في تحويل التاريخ")
+        raise HTTPException(status_code=400, detail=f"خطأ في تحويل التاريخ: {str(e)}")
 
 # -----------------------------------------------------
-# 💼 استشارة تربوية (مع Rate Limit)
+# الحصول على التاريخ الحالي (هجري وميلادي)
+# -----------------------------------------------------
+@app.get("/dates/current")
+async def get_current_dates():
+    """الحصول على التاريخ الحالي هجري وميلادي"""
+    try:
+        import aiohttp
+        from datetime import datetime
+        
+        today = datetime.now()
+        day = today.day
+        month = today.month
+        year = today.year
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f'https://api.aladhan.com/v1/gToH?date={day}-{month}-{year}') as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data['code'] == 200:
+                        hijri = data['data']['hijri']
+                        
+                        # تحويل الأرقام الإنجليزية إلى عربية
+                        english_to_arabic = {
+                            '0': '٠', '1': '١', '2': '٢', '3': '٣', '4': '٤',
+                            '5': '٥', '6': '٦', '7': '٧', '8': '٨', '9': '٩'
+                        }
+                        
+                        hijri_day = str(hijri['day'])
+                        hijri_month = str(hijri['month']['number'])
+                        hijri_year = str(hijri['year'])
+                        
+                        for english, arabic in english_to_arabic.items():
+                            hijri_day = hijri_day.replace(english, arabic)
+                            hijri_month = hijri_month.replace(english, arabic)
+                            hijri_year = hijri_year.replace(english, arabic)
+                        
+                        hijri_date = f"{hijri_year}/{hijri_month}/{hijri_day}"
+                        gregorian_date = f"{day}/{month}/{year}"
+                        
+                        # تحويل التاريخ الميلادي إلى عربي
+                        gregorian_arabic = gregorian_date
+                        for english, arabic in english_to_arabic.items():
+                            gregorian_arabic = gregorian_arabic.replace(english, arabic)
+                        
+                        return {
+                            "hijri_date": hijri_date,
+                            "gregorian_date": gregorian_arabic,
+                            "english_hijri": f"{hijri['year']}/{hijri['month']['number']}/{hijri['day']}",
+                            "english_gregorian": gregorian_date
+                        }
+        
+        return {
+            "hijri_date": "١٤٤٦/٠٦/٠١",
+            "gregorian_date": "2024/12/01",
+            "note": "تعذر الحصول على التواريخ الحقيقية"
+        }
+        
+    except Exception as e:
+        return {
+            "hijri_date": "١٤٤٦/٠٦/٠١",
+            "gregorian_date": "2024/12/01",
+            "error": str(e)
+        }
+
+# -----------------------------------------------------
+# حفظ بيانات المعلم
+# -----------------------------------------------------
+@app.post("/teacher/save")
+def save_teacher_data(data: SaveTeacherRequest, user = Depends(get_current_user)):
+    """حفظ بيانات المعلم على الخادم"""
+    try:
+        user_id = user.get("sub", "anonymous")
+        
+        if user_id not in USER_DATA:
+            USER_DATA[user_id] = {}
+        
+        USER_DATA[user_id]["teacher_data"] = data.dict()
+        USER_DATA[user_id]["last_saved"] = datetime.utcnow().isoformat()
+        
+        return {
+            "success": True,
+            "message": "تم حفظ بيانات المعلم بنجاح",
+            "last_saved": USER_DATA[user_id]["last_saved"]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"خطأ في حفظ البيانات: {str(e)}")
+
+# -----------------------------------------------------
+# تحميل بيانات المعلم المحفوظة
+# -----------------------------------------------------
+@app.get("/teacher/load")
+def load_teacher_data(user = Depends(get_current_user)):
+    """تحميل بيانات المعلم المحفوظة"""
+    try:
+        user_id = user.get("sub", "anonymous")
+        
+        if user_id in USER_DATA and "teacher_data" in USER_DATA[user_id]:
+            return {
+                "success": True,
+                "data": USER_DATA[user_id]["teacher_data"],
+                "last_saved": USER_DATA[user_id].get("last_saved")
+            }
+        else:
+            return {
+                "success": False,
+                "message": "لا توجد بيانات محفوظة",
+                "data": {}
+            }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"خطأ في تحميل البيانات: {str(e)}")
+
+# -----------------------------------------------------
+# إرسال طلب دعم فني
+# -----------------------------------------------------
+@app.post("/support/send")
+async def send_support_request(data: SupportRequest, background_tasks: BackgroundTasks):
+    """إرسال طلب الدعم الفني"""
+    try:
+        # يمكن هنا إرسال الإيميل أو حفظ الطلب في قاعدة بيانات
+        support_data = {
+            "name": data.name,
+            "phone": data.phone,
+            "issue": data.issue,
+            "timestamp": datetime.utcnow().isoformat(),
+            "ip": "127.0.0.1"  # في الواقع سيتم الحصول على IP المستخدم
+        }
+        
+        # حفظ الطلب مؤقتاً (يمكن استخدام قاعدة بيانات)
+        if "support_requests" not in USER_DATA:
+            USER_DATA["support_requests"] = []
+        
+        USER_DATA["support_requests"].append(support_data)
+        
+        # إعداد رابط الواتساب
+        whatsapp_message = f"طلب دعم فني - أداة إصدار التقارير\n\nالاسم: {data.name}\nرقم التواصل: {data.phone}\n\nتفاصيل المشكلة:\n{data.issue}\n\n---\nتم الإرسال في: {support_data['timestamp']}"
+        whatsapp_url = f"https://wa.me/966597077245?text={whatsapp_message}"
+        
+        # إعداد رابط الإيميل
+        email_subject = "طلب دعم فني - أداة إصدار التقارير"
+        email_body = f"الاسم: {data.name}\nرقم التواصل: {data.phone}\n\nتفاصيل المشكلة:\n{data.issue}\n\n---\nتم الإرسال في: {support_data['timestamp']}"
+        email_url = f"mailto:iFahadenglish@gmail.com?subject={email_subject}&body={email_body}"
+        
+        return {
+            "success": True,
+            "message": "تم إرسال طلب الدعم بنجاح",
+            "whatsapp_url": whatsapp_url,
+            "email_url": email_url,
+            "support_data": support_data
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"خطأ في إرسال طلب الدعم: {str(e)}")
+
+# -----------------------------------------------------
+# توليد نسخة PDF من التقرير (محاكاة)
+# -----------------------------------------------------
+@app.post("/generate/pdf")
+async def generate_pdf_report(data: Dict[str, Any], user = Depends(get_current_user)):
+    """توليد نسخة PDF من التقرير"""
+    try:
+        # في الواقع يمكن استخدام مكتبة مثل ReportLab أو WeasyPrint
+        # هنا نرجع بيانات التقرير فقط
+        
+        report_data = {
+            "report_type": data.get("report_type", "تقرير"),
+            "education": data.get("education", ""),
+            "school": data.get("school", ""),
+            "teacher": data.get("teacher", ""),
+            "grade": data.get("grade", ""),
+            "subject": data.get("subject", ""),
+            "lesson": data.get("lesson", ""),
+            "goal": data.get("goal", ""),
+            "summary": data.get("summary", ""),
+            "steps": data.get("steps", ""),
+            "strategies": data.get("strategies", ""),
+            "strengths": data.get("strengths", ""),
+            "improve": data.get("improve", ""),
+            "recomm": data.get("recomm", ""),
+            "tools": data.get("tools", []),
+            "hijri_date": data.get("hijri_date", ""),
+            "gregorian_date": data.get("gregorian_date", ""),
+            "generated_at": datetime.utcnow().isoformat()
+        }
+        
+        # محاكاة اسم الملف
+        report_name = data.get("report_type", "تقرير").replace("/", "-").replace("\\", "-")
+        file_name = f"{report_name}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.pdf"
+        
+        return {
+            "success": True,
+            "message": "تم إنشاء التقرير بنجاح",
+            "file_name": file_name,
+            "report_data": report_data,
+            "download_url": f"/reports/download/{file_name}",  # محاكاة رابط التحميل
+            "preview_url": f"/reports/preview/{file_name}"    # محاكاة رابط المعاينة
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"خطأ في إنشاء PDF: {str(e)}")
+
+# -----------------------------------------------------
+# استشارة تربوية (إضافية)
 # -----------------------------------------------------
 @app.post("/consult/educational")
-def educational_consultation(data: AskRequest, x_token: str = Header(..., alias="X-Token")):
-    verify_jwt(x_token)
-    rate_limit_guard(x_token)
-    validate_prompt(data.prompt)
-    
+def educational_consultation(data: AskRequest, user = Depends(get_current_user)):
+    """استشارة تربوية مع خبير تعليمي"""
     consult_prompt = f"""أنت مستشار تربوي محترف مع خبرة 20 سنة في المجال التعليمي.
 الاستشارة المطلوبة: {data.prompt}
 
@@ -1047,40 +1139,31 @@ def educational_consultation(data: AskRequest, x_token: str = Header(..., alias=
             "advisor": "خبير تربوي - نظام ناصر التعليمي"
         }
     except Exception as e:
-        safe_500()
+        raise HTTPException(status_code=500, detail=str(e))
 
 # -----------------------------------------------------
-# 🧹 تحديث الذاكرة (تنظيف الكود المنتهي)
+# الحصول على معلومات النظام
 # -----------------------------------------------------
-@app.on_event("startup")
-async def startup_event():
-    now = datetime.utcnow()
-    expired_codes = [k for k, v in VALID_CODES.items() if v < now]
-    for code in expired_codes:
-        VALID_CODES.pop(code, None)
-    print(f"[STARTUP] تم تنظيف {len(expired_codes)} كود منتهي")
-
-# -----------------------------------------------------
-# 🧹 تنظيف Rate Limit القديم
-# -----------------------------------------------------
-@app.on_event("startup")
-async def cleanup_rate_limit():
-    global _request_log
-    now = time.time()
-    window_start = now - RATE_WINDOW
-    
-    for token in list(_request_log.keys()):
-        timestamps = [t for t in _request_log[token] if t > window_start]
-        if timestamps:
-            _request_log[token] = timestamps
-        else:
-            _request_log.pop(token, None)
+@app.get("/system/info")
+def get_system_info():
+    """الحصول على معلومات النظام والنسخ"""
+    return {
+        "system_name": "ناصر - نظام إصدار التقارير التعليمية",
+        "version": "2.6.0",
+        "api_version": "1.0",
+        "developer": "فهد الخالدي",
+        "support_email": "iFahadenglish@gmail.com",
+        "support_phone": "+966597077245",
+        "features": [
+            "توليد التقارير التعليمية الذكية",
+            "تحويل التاريخ الهجري/الميلادي",
+            "حفظ بيانات المعلم",
+            "الدعم الفني المتكامل",
+            "تصدير إلى PDF",
+            "مشاركة عبر واتساب"
+        ],
+        "last_updated": "2026-02-07"
+    }
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", 8000)),
-        log_level="info"
-    )
+    uvicorn.run(app, host="0.0.0.0", port=8000)
