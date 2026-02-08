@@ -82,13 +82,13 @@ def root():
 def health(_: int = Depends(activation_required)):
     return {"status": "ok"}
 
-# ---------- Main Feature (Usage counted HERE only) ----------
+# ---------- Main Feature (usage counted ONLY here) ----------
 @app.post("/ask")
 def ask(
     req: Req,
     code_id: int = Depends(activation_required)
 ):
-    # 🔥 Count usage ONLY here
+    # ⬅️ الخصم هنا فقط
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
@@ -109,7 +109,7 @@ def ask(
 
     return {"answer": response.text}
 
-# ---------- Admin API ----------
+# ---------- Admin APIs (محميّة بالتوكن) ----------
 @app.post("/admin/generate", dependencies=[Depends(admin_auth)])
 def admin_generate(req: GenerateKeyReq):
     if req.plan not in PLANS:
@@ -151,13 +151,13 @@ def admin_codes():
     conn.close()
 
     now = datetime.utcnow()
-
     result = []
+
     for r in rows:
         expired = False
         if r[3] and datetime.fromisoformat(r[3]) < now:
             expired = True
-        if r[5] >= r[4]:
+        if r[4] is not None and r[5] >= r[4]:
             expired = True
 
         result.append({
@@ -197,11 +197,7 @@ def admin_delete(code_id: int):
     conn.close()
     return {"status": "deleted"}
 
-# ---------- Admin Panel (HTML) ----------
-@app.get(
-    "/admin/panel",
-    response_class=HTMLResponse,
-    dependencies=[Depends(admin_auth)]
-)
+# ---------- Admin Panel HTML (بدون حماية هيدر) ----------
+@app.get("/admin/panel", response_class=HTMLResponse)
 def admin_panel():
     return Path("admin.html").read_text(encoding="utf-8")
