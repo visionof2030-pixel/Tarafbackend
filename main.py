@@ -3,19 +3,20 @@ from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
+from pathlib import Path
+from datetime import datetime, timedelta
 import os
 import itertools
-from datetime import datetime, timedelta
 import google.generativeai as genai
 
 from database import init_db, get_connection
 from create_key import create_key
 from security import activation_required
 
+# ---------- Init DB ----------
 init_db()
 
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
-
+# ---------- App ----------
 app = FastAPI()
 
 app.add_middleware(
@@ -25,6 +26,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ---------- Admin Auth ----------
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
+
+def admin_auth(x_admin_token: str = Header(...)):
+    if x_admin_token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 # ---------- Models ----------
 class Req(BaseModel):
@@ -65,10 +73,6 @@ def get_api_key():
         raise HTTPException(status_code=500, detail="No Gemini API key configured")
     return next(key_cycle)
 
-def admin_auth(x_admin_token: str = Header(...)):
-    if x_admin_token != ADMIN_TOKEN:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
 # ---------- Routes ----------
 @app.get("/")
 def root():
@@ -78,12 +82,13 @@ def root():
 def health(_: int = Depends(activation_required)):
     return {"status": "ok"}
 
+# ---------- Main Feature (Usage counted HERE only) ----------
 @app.post("/ask")
 def ask(
     req: Req,
     code_id: int = Depends(activation_required)
 ):
-    # 🔥 هنا فقط يُحتسب الاستخدام
+    # 🔥 Count usage ONLY here
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
@@ -104,7 +109,7 @@ def ask(
 
     return {"answer": response.text}
 
-# ---------- Admin ----------
+# ---------- Admin API ----------
 @app.post("/admin/generate", dependencies=[Depends(admin_auth)])
 def admin_generate(req: GenerateKeyReq):
     if req.plan not in PLANS:
@@ -124,7 +129,7 @@ def admin_generate(req: GenerateKeyReq):
             expires_at.isoformat(),
             plan["usage"]
         ),
-        "expires_at": expires_at,
+        "expires_at": expires_at.isoformat(),
         "usage_limit": plan["usage"]
     }
 
@@ -132,28 +137,51 @@ def admin_generate(req: GenerateKeyReq):
 def admin_codes():
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute(
-        "SELECT id, code, is_active, usage_count, usage_limit FROM activation_codes"
-    )
+    cur.execute("""
+        SELECT
+            id,
+            code,
+            is_active,
+            expires_at,
+            usage_limit,
+            usage_count
+        FROM activation_codes
+    """)
     rows = cur.fetchall()
     conn.close()
-    return [
-        {
+
+    now = datetime.utcnow()
+
+    result = []
+    for r in rows:
+        expired = False
+        if r[3] and datetime.fromisoformat(r[3]) < now:
+            expired = True
+        if r[5] >= r[4]:
+            expired = True
+
+        result.append({
             "id": r[0],
             "code": r[1],
             "active": bool(r[2]),
-            "usage": r[3],
-            "limit": r[4],
-        }
-        for r in rows
-    ]
+            "expires_at": r[3],
+            "usage_limit": r[4],
+            "usage_count": r[5],
+            "expired": expired
+        })
+
+    return result
 
 @app.put("/admin/code/{code_id}/toggle", dependencies=[Depends(admin_auth)])
 def admin_toggle(code_id: int):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        "UPDATE activation_codes SET is_active = CASE WHEN is_active=1 THEN 0 ELSE 1 END WHERE id=?",
+        """
+        UPDATE activation_codes
+        SET is_active = CASE WHEN is_active=1 THEN 0 ELSE 1 END
+        WHERE id = ?
+        """,
         (code_id,)
     )
     conn.commit()
@@ -169,6 +197,11 @@ def admin_delete(code_id: int):
     conn.close()
     return {"status": "deleted"}
 
-@app.get("/admin", response_class=HTMLResponse)
-def admin_page():
-    return "<h3>Admin Panel Ready</h3>"
+# ---------- Admin Panel (HTML) ----------
+@app.get(
+    "/admin/panel",
+    response_class=HTMLResponse,
+    dependencies=[Depends(admin_auth)]
+)
+def admin_panel():
+    return Path("admin.html").read_text(encoding="utf-8")
