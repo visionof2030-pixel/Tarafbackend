@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="ar">
+<head>
+<meta charset="UTF-8">
+<title>Admin Panel</title>
+<style>
+body {
+    font-family: Arial, sans-serif;
+    background: #f4f6f8;
+    padding: 20px;
+}
+h1 {
+    margin-bottom: 10px;
+}
+section {
+    background: #fff;
+    padding: 15px;
+    margin-top: 20px;
+    border-radius: 6px;
+}
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 10px;
+}
+th, td {
+    border: 1px solid #ddd;
+    padding: 8px;
+    text-align: center;
+}
+th {
+    background: #f0f0f0;
+}
+button {
+    padding: 5px 10px;
+    cursor: pointer;
+}
+.active {
+    color: green;
+    font-weight: bold;
+}
+.expired {
+    color: red;
+    font-weight: bold;
+}
+</style>
+</head>
+
+<body>
+
+<h1>Admin Panel</h1>
+
+<!-- Generate Code -->
+<section>
+<h2>إنشاء كود جديد</h2>
+<select id="plan">
+    <option value="5min_1">5 دقائق - 1 استخدام</option>
+    <option value="15min_2">15 دقيقة - 2 استخدام</option>
+    <option value="30min_3">30 دقيقة - 3 استخدام</option>
+    <option value="1day_6">يوم - 6 استخدام</option>
+    <option value="3day_15">3 أيام - 15 استخدام</option>
+    <option value="7day_25">7 أيام - 25 استخدام</option>
+    <option value="1m_45">شهر - 45 استخدام</option>
+    <option value="2m_65">شهرين - 65 استخدام</option>
+    <option value="3m_120">3 شهور - 120 استخدام</option>
+    <option value="5m_200">5 شهور - 200 استخدام</option>
+</select>
+<button onclick="generate()">إنشاء</button>
+<p id="newCode"></p>
+</section>
+
+<!-- Active Codes -->
+<section>
+<h2>الأكواد الفعّالة</h2>
+<table>
+<thead>
+<tr>
+<th>الكود</th>
+<th>الانتهاء</th>
+<th>الاستخدام</th>
+<th>الحالة</th>
+<th>إجراء</th>
+</tr>
+</thead>
+<tbody id="activeCodes"></tbody>
+</table>
+</section>
+
+<!-- Expired Codes -->
+<section>
+<h2>الأكواد المنتهية / الموقوفة</h2>
+<table>
+<thead>
+<tr>
+<th>الكود</th>
+<th>الانتهاء</th>
+<th>الاستخدام</th>
+<th>الحالة</th>
+<th>إجراء</th>
+</tr>
+</thead>
+<tbody id="expiredCodes"></tbody>
+</table>
+</section>
+
+<script>
+const ADMIN_TOKEN = prompt("أدخل ADMIN TOKEN");
+
+function headers() {
+    return {
+        "Content-Type": "application/json",
+        "x-admin-token": ADMIN_TOKEN
+    };
+}
+
+function generate() {
+    const plan = document.getElementById("plan").value;
+    fetch("/admin/generate", {
+        method: "POST",
+        headers: headers(),
+        body: JSON.stringify({ plan })
+    })
+    .then(r => r.json())
+    .then(d => {
+        document.getElementById("newCode").innerText = "تم إنشاء الكود: " + d.code;
+        loadCodes();
+    });
+}
+
+function toggle(id) {
+    fetch(`/admin/code/${id}/toggle`, {
+        method: "PUT",
+        headers: headers()
+    }).then(loadCodes);
+}
+
+function removeCode(id) {
+    if (!confirm("حذف الكود؟")) return;
+    fetch(`/admin/code/${id}`, {
+        method: "DELETE",
+        headers: headers()
+    }).then(loadCodes);
+}
+
+function loadCodes() {
+    fetch("/admin/codes", { headers: headers() })
+    .then(r => r.json())
+    .then(data => {
+        const active = document.getElementById("activeCodes");
+        const expired = document.getElementById("expiredCodes");
+        active.innerHTML = "";
+        expired.innerHTML = "";
+
+        data.forEach(c => {
+            const row = document.createElement("tr");
+            row.innerHTML = `
+                <td>${c.code}</td>
+                <td>${c.expires_at || "-"}</td>
+                <td>${c.usage_count} / ${c.usage_limit}</td>
+                <td class="${c.expired ? "expired" : "active"}">
+                    ${c.expired ? "منتهي" : "فعّال"}
+                </td>
+                <td>
+                    <button onclick="toggle(${c.id})">تفعيل / إيقاف</button>
+                    <button onclick="removeCode(${c.id})">حذف</button>
+                </td>
+            `;
+            (c.expired ? expired : active).appendChild(row);
+        });
+    });
+}
+
+loadCodes();
+</script>
+
+</body>
+</html>
